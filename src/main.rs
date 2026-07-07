@@ -4,6 +4,7 @@ mod eval;
 mod movegen;
 mod perft;
 mod search;
+mod see;
 mod types;
 mod zobrist;
 
@@ -156,6 +157,27 @@ fn parse_uci_move(b: &Board, uci: &str) -> Option<Move> {
     moves.into_iter().find(|m| m.from == from && m.to == to && m.promotion == promo)
 }
 
+/// Construye una jugada SIN validar legalidad real de movimiento (solo
+/// determina el flag -- Captura/AlPaso/Silenciosa -- a partir del estado
+/// del tablero). Necesario para los casos sinteticos de test de SEE, donde
+/// el "atacante inicial" puede estar bloqueado en la realidad (igual que
+/// hace el test_see.py de Python, que tampoco valida legalidad del primer
+/// movimiento -- SEE en si mismo confia en que el llamador ya eligio un
+/// atacante valido).
+fn jugada_sintetica(b: &Board, uci: &str) -> Move {
+    let from = types::square_from_name(&uci[0..2]).unwrap();
+    let to = types::square_from_name(&uci[2..4]).unwrap();
+    let es_al_paso = b.piece_at(from).map(|(_, pt)| pt) == Some(PieceType::Pawn) && Some(to) == b.ep_square;
+    let flag = if es_al_paso {
+        MoveFlag::EnPassant
+    } else if b.piece_at(to).is_some() {
+        MoveFlag::Capture
+    } else {
+        MoveFlag::Quiet
+    };
+    Move::new(from, to, None, flag)
+}
+
 fn run_cxb4_bug() {
     let fen = "r1b1k2r/ppqp1ppp/4p3/4n3/1b6/2PQBN2/P1P2PPP/R3KB1R w KQkq - 0 11";
     let b = Board::from_fen(fen).unwrap();
@@ -164,6 +186,78 @@ fn run_cxb4_bug() {
     let uci = mv.map(|m| m.to_uci()).unwrap_or_default();
     println!("FEN bug cxb4: jugada elegida = {} (score {}, {} nodos)", uci, sc, nodes);
     println!("{}", if uci == "c3b4" { "eligio cxb4 (igual que v3 sin proteccion)" } else { "NO eligio cxb4" });
+}
+
+fn run_see_tests() {
+    let mut ok = true;
+    let casos: Vec<(&str, &str, &str, i32)> = vec![
+        ("Caso 1 (captura libre)", "k7/8/8/7p/8/8/8/K6R w - - 0 1", "h1h5", 100),
+        ("Caso 2 (1v1, mal cambio)", "k2r4/8/8/3p4/8/8/8/K2R4 w - - 0 1", "d1d5", 100 - 500),
+        ("Caso 3 (2 atacantes vs 1 defensor)", "k2r4/8/8/3p4/8/8/3R4/K2R4 w - - 0 1", "d1d5", 100),
+        ("Caso 4 (cxd5 con recaptura de peon)", "k7/8/4p3/3n4/2P5/1N6/8/K7 w - - 0 1", "c4d5", 220),
+        ("Caso 5 (al paso, sin recaptura)", "k7/8/8/3pP3/8/8/8/K7 w - d6 0 1", "e5d6", 100),
+        ("Caso 5b (al paso con recaptura)", "k7/2p5/8/3pP3/8/8/8/K7 w - d6 0 1", "e5d6", 0),
+        ("Caso 6 (FEN del bug, cxb4)", "r1b1k2r/ppqp1ppp/4p3/4n3/1b6/2PQBN2/P1P2PPP/R3KB1R w KQkq - 0 11", "c3b4", 330),
+    ];
+    for (nombre, fen, uci, esperado) in &casos {
+        let b = Board::from_fen(fen).unwrap();
+        let mv = jugada_sintetica(&b, uci);
+        let r = see::see(&b, &mv);
+        let pass = r == *esperado;
+        ok &= pass;
+        println!("{} {}: see={} esperado={}", if pass { "OK  " } else { "FALLO" }, nombre, r, esperado);
+    }
+    println!("{}", if ok { "TODOS LOS CASOS DE SEE OK" } else { "HAY FALLOS EN SEE" });
+
+    // Oraculo de fuerza bruta: posiciones al azar (self-play con jugadas
+    // aleatorias desde la posicion inicial), comparando see() contra un
+    // minimax real sobre TODAS las jugadas de captura posibles.
+    println!("\nVerificando contra oraculo de fuerza bruta...");
+    let mut rng_state: u64 = 0xC0FFEE1234567u64;
+    let mut next_rand = move || {
+        rng_state ^= rng_state << 13;
+        rng_state ^= rng_state >> 7;
+        rng_state ^= rng_state << 17;
+        rng_state
+    };
+
+    let mut total_capturas = 0u64;
+    let mut discrepancias = 0u64;
+    for _partida in 0..5000 {
+        let mut b = Board::startpos();
+        let plies = 4 + (next_rand() % 20) as u32;
+        let mut valida = true;
+        for _ in 0..plies {
+            let moves = movegen::generate_legal(&b);
+            if moves.is_empty() {
+                valida = false;
+                break;
+            }
+            let mv = moves[(next_rand() as usize) % moves.len()];
+            b = b.make_move(&mv);
+        }
+        if !valida {
+            continue;
+        }
+        let capturas: Vec<Move> = movegen::generate_legal(&b).into_iter().filter(|m| m.is_capture()).collect();
+        for mv in capturas {
+            let rapido = see::see(&b, &mv);
+            let oraculo = see::see_oracle(&b, &mv);
+            total_capturas += 1;
+            if rapido != oraculo {
+                discrepancias += 1;
+                println!(
+                    "  DISCREPANCIA: fen='{}' jugada={} see={} oraculo={}",
+                    b.to_fen(), mv.to_uci(), rapido, oraculo
+                );
+            }
+        }
+    }
+    println!(
+        "{} capturas comparadas, {} discrepancias -- {}",
+        total_capturas, discrepancias,
+        if discrepancias == 0 { "SEE COINCIDE CON EL ORACULO" } else { "HAY DISCREPANCIAS, revisar" }
+    );
 }
 
 fn uci_loop() {
@@ -283,6 +377,10 @@ fn main() {
             }
             "cxb4test" => {
                 run_cxb4_bug();
+                return;
+            }
+            "seetest" => {
+                run_see_tests();
                 return;
             }
             _ => {}

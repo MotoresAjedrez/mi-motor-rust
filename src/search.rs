@@ -40,12 +40,18 @@ struct TTEntry {
 
 pub struct TimeUp;
 
+const MAX_KILLER_PLY: usize = 100; // margen sobre MAX_PLY para cubrir extensiones de jaque
+
 pub struct Searcher {
     tt: Vec<Option<TTEntry>>,
     tt_mask: usize,
     pub nodes: u64,
     deadline: Option<Instant>,
     stop: bool,
+    // killers son validos solo dentro de esta busqueda (por ply del arbol
+    // actual); history SI persiste entre jugadas de la partida, igual que la TT.
+    killers: Vec<[Option<Move>; 2]>,
+    history: Box<[[i32; 64]; 64]>, // [from][to] -- arreglo plano, mas rapido que un HashMap aqui
 }
 
 fn valor_pieza(pt: crate::types::PieceType) -> i32 {
@@ -64,13 +70,37 @@ impl Searcher {
         let entry_size = std::mem::size_of::<Option<TTEntry>>().max(1);
         let mut n_entries = (tt_mb * 1024 * 1024 / entry_size).max(1024);
         n_entries = n_entries.next_power_of_two() >> 1; // asegurar potencia de 2 sin pasarse
-        Searcher { tt: vec![None; n_entries], tt_mask: n_entries - 1, nodes: 0, deadline: None, stop: false }
+        Searcher {
+            tt: vec![None; n_entries],
+            tt_mask: n_entries - 1,
+            nodes: 0,
+            deadline: None,
+            stop: false,
+            killers: vec![[None, None]; MAX_KILLER_PLY],
+            history: Box::new([[0i32; 64]; 64]),
+        }
+    }
+
+    fn registrar_corte(&mut self, mv: Move, ply: u32, depth: i32) {
+        if mv.is_capture() {
+            return; // MVV-LVA/SEE ya ordenan las capturas primero, no necesitan refuerzo
+        }
+        let p = ply as usize;
+        if p < MAX_KILLER_PLY {
+            let k = &mut self.killers[p];
+            if k[0] != Some(mv) {
+                k[1] = k[0];
+                k[0] = Some(mv);
+            }
+        }
+        self.history[mv.from as usize][mv.to as usize] += depth * depth;
     }
 
     pub fn clear_tt(&mut self) {
         for e in self.tt.iter_mut() {
             *e = None;
         }
+        self.history = Box::new([[0i32; 64]; 64]);
     }
 
     fn tt_index(&self, key: u64) -> usize {
@@ -104,22 +134,28 @@ impl Searcher {
     }
 
     fn order_moves(&self, b: &Board, moves: &mut Vec<Move>, tt_move: Option<Move>) {
+        self.order_moves_ply(b, moves, tt_move, MAX_KILLER_PLY as u32);
+    }
+
+    /// Igual que order_moves pero ademas usa killers/history (por ply) para
+    /// ordenar las jugadas silenciosas -- capturas/TT siguen mandando.
+    fn order_moves_ply(&self, b: &Board, moves: &mut Vec<Move>, tt_move: Option<Move>, ply: u32) {
+        let p = ply as usize;
+        let killers = if p < MAX_KILLER_PLY { Some(self.killers[p]) } else { None };
         moves.sort_by_key(|mv| {
             if Some(*mv) == tt_move {
                 return -1_000_000;
             }
             if mv.is_capture() {
-                let victim = if mv.flag == MoveFlag::EnPassant {
-                    100
-                } else {
-                    b.piece_at(mv.to).map(|(_, pt)| valor_pieza(pt)).unwrap_or(0)
-                };
-                let attacker = b.piece_at(mv.from).map(|(_, pt)| valor_pieza(pt)).unwrap_or(0);
-                -(10_000 + victim * 16 - attacker)
+                -(10_000 + crate::see::see(b, mv))
             } else if mv.promotion.is_some() {
                 -5000
+            } else if killers.is_some_and(|k| k[0] == Some(*mv)) {
+                -3000
+            } else if killers.is_some_and(|k| k[1] == Some(*mv)) {
+                -2900
             } else {
-                0
+                -self.history[mv.from as usize][mv.to as usize]
             }
         });
     }
@@ -142,17 +178,27 @@ impl Searcher {
 
         let mut best = stand_pat;
         for mv in moves {
-            let next = b.make_move(&mv);
-            if next.in_check(b.turn) {
-                continue; // ilegal: propio rey quedaria en jaque
+            // Filtro SEE: descarta capturas claramente perdedoras (no las
+            // prueba ni gasta tiempo en ellas). Margen -50, no se aplica a
+            // promociones (la poda delta de abajo ya las valora aparte).
+            if mv.promotion.is_none() && crate::see::see(b, &mv) < -50 {
+                continue;
             }
             let victim = if mv.flag == MoveFlag::EnPassant {
                 100
             } else {
                 b.piece_at(mv.to).map(|(_, pt)| valor_pieza(pt)).unwrap_or(0)
             };
-            if stand_pat + victim + 200 <= alpha {
+            let mut ganancia = victim;
+            if mv.promotion.is_some() {
+                ganancia += 800;
+            }
+            if stand_pat + ganancia + 250 <= alpha {
                 continue; // poda delta
+            }
+            let next = b.make_move(&mv);
+            if next.in_check(b.turn) {
+                continue; // ilegal: propio rey quedaria en jaque
             }
             let sc = -self.quiescence(&next, -beta, -alpha, ply + 1)?;
             if sc > best {
@@ -222,7 +268,7 @@ impl Searcher {
         if moves.is_empty() {
             return Ok(if en_jaque { -MATE + ply as i32 } else { 0 });
         }
-        self.order_moves(b, &mut moves, tt_move);
+        self.order_moves_ply(b, &mut moves, tt_move, ply);
 
         let mut best_score = -INFINITO;
         let mut best_move = None;
@@ -237,6 +283,7 @@ impl Searcher {
                 alpha = sc;
             }
             if alpha >= beta {
+                self.registrar_corte(*mv, ply, depth);
                 break;
             }
         }
@@ -258,6 +305,7 @@ impl Searcher {
         self.nodes = 0;
         self.deadline = None;
         self.stop = false;
+        self.killers = vec![[None, None]; MAX_KILLER_PLY];
         let mut mejor_mv = None;
         let mut mejor_sc = -INFINITO;
         for d in 1..=depth {
@@ -266,7 +314,7 @@ impl Searcher {
                 break;
             }
             let mut ordered = moves.clone();
-            self.order_moves(b, &mut ordered, mejor_mv);
+            self.order_moves_ply(b, &mut ordered, mejor_mv, 0);
             let mut alpha = -INFINITO;
             let mut actual_mv = ordered[0];
             let mut actual_sc = -INFINITO;
@@ -294,6 +342,7 @@ impl Searcher {
     pub fn search_time(&mut self, b: &Board, movetime_ms: u64, max_depth: i32, mut on_info: impl FnMut(i32, i32, u64, u64)) -> (Option<Move>, i32) {
         self.nodes = 0;
         self.stop = false;
+        self.killers = vec![[None, None]; MAX_KILLER_PLY];
         let inicio = Instant::now();
         let budget = movetime_ms.saturating_sub(30).max(10);
         self.deadline = Some(inicio + std::time::Duration::from_millis(budget));
@@ -307,7 +356,7 @@ impl Searcher {
                 break;
             }
             let mut ordered = moves.clone();
-            self.order_moves(b, &mut ordered, mejor_mv);
+            self.order_moves_ply(b, &mut ordered, mejor_mv, 0);
             let mut alpha = -INFINITO;
             let mut actual_mv = ordered[0];
             let mut actual_sc = -INFINITO;
