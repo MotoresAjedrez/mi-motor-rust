@@ -7,12 +7,36 @@ use crate::board::Board;
 use crate::eval::evaluate;
 use crate::movegen::{generate_legal, generate_pseudo_legal};
 use crate::types::{Move, MoveFlag};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 pub const INFINITO: i32 = 30_000;
 pub const MATE: i32 = 29_000;
 const MAX_PLY: u32 = 64;
+
+// Contempt dinamico: en vez de puntuar toda tabla (repeticion/regla de 50)
+// como exactamente 0, se mide la evaluacion estatica de la posicion desde la
+// perspectiva de quien mueve. Si esta claramente ganando (por encima del
+// umbral), la tabla se puntua PEOR que 0 -- para que la busqueda la evite
+// activamente cuando hay alternativas de progreso, en vez de solo reconocerla
+// una vez que ya esta ahi. Si esta claramente perdiendo, se puntua MEJOR que
+// 0 -- para que la busque activamente como recurso defensivo. Es una funcion
+// de la posicion (no depende del historial de jugadas), asi que es seguro
+// guardarla en la TT igual que cualquier otro puntaje.
+const CONTEMPT_UMBRAL: i32 = 500;
+const CONTEMPT_PENALIZACION: i32 = 200;
+
+fn draw_score(b: &Board) -> i32 {
+    let se = evaluate(b);
+    if se > CONTEMPT_UMBRAL {
+        -CONTEMPT_PENALIZACION
+    } else if se < -CONTEMPT_UMBRAL {
+        CONTEMPT_PENALIZACION
+    } else {
+        0
+    }
+}
 
 fn solo_peones_y_rey(b: &Board, color: crate::types::Color) -> bool {
     let idx = color as usize;
@@ -71,6 +95,10 @@ pub struct Searcher {
     killers: Vec<[Option<Move>; 2]>,
     history: Box<[[i32; 64]; 64]>, // [from][to] -- arreglo plano, mas rapido que un HashMap aqui
     pub modo_lmr: bool,
+    // Desactivable solo para comparacion A/B en pruebas (MIMOTOR_NO_ASPIRATION=1)
+    // -- en juego real siempre queda activado, la tecnica en si es segura por
+    // construccion (ensancha hasta ventana completa si hace falta).
+    pub modo_aspiration: bool,
     // Historial de repeticion: claves Zobrist de la PARTIDA REAL (persiste
     // entre llamadas a go, la maneja el loop UCI) + las de la linea actual
     // de busqueda (crece/decrece durante la recursion, como el "self.hist"
@@ -84,6 +112,12 @@ pub struct Searcher {
     // jugadas del orden en la RAIZ (una vez, al armar el orden inicial) para
     // no explorar exactamente la misma linea primero que los demas hilos.
     pub variante_orden_raiz: bool,
+    // Bandera compartida con el hilo principal del loop UCI: permite que el
+    // comando "stop" interrumpa una busqueda en curso (que corre en su
+    // propio hilo -- ver uci_loop en main.rs) sin depender solo del deadline
+    // de tiempo. Necesario para "go infinite" y para cumplir el protocolo
+    // UCI que exigen los testers de listas de rating como CCRL.
+    external_stop: Option<Arc<AtomicBool>>,
 }
 
 fn valor_pieza(pt: crate::types::PieceType) -> i32 {
@@ -108,12 +142,18 @@ impl Searcher {
             stop: false,
             killers: vec![[None, None]; MAX_KILLER_PLY],
             history: Box::new([[0i32; 64]; 64]),
-            modo_lmr: std::env::var("MIMOTOR_LMR").as_deref() == Ok("1"),
+            // Activado por defecto: el torneo h2h de esta sesion confirmo
+            // +80 ELO (61.3% en 40 partidas) con la reescritura PVS -- ver
+            // resultados_lmr_h2h.txt en ~/mi-motor. MIMOTOR_LMR=0 lo desactiva
+            // explicitamente para pruebas comparativas.
+            modo_lmr: std::env::var("MIMOTOR_LMR").as_deref() != Ok("0"),
+            modo_aspiration: std::env::var("MIMOTOR_NO_ASPIRATION").as_deref() != Ok("1"),
             game_history: Vec::new(),
             path: Vec::new(),
             lmr_intentos: 0,
             lmr_reintentos: 0,
             variante_orden_raiz: false,
+            external_stop: None,
         }
     }
 
@@ -131,12 +171,20 @@ impl Searcher {
             killers: vec![[None, None]; MAX_KILLER_PLY],
             history: Box::new([[0i32; 64]; 64]),
             modo_lmr,
+            modo_aspiration: std::env::var("MIMOTOR_NO_ASPIRATION").as_deref() != Ok("1"),
             game_history: Vec::new(),
             path: Vec::new(),
             lmr_intentos: 0,
             lmr_reintentos: 0,
             variante_orden_raiz: false,
+            external_stop: None,
         }
+    }
+
+    /// Fija (o quita) la bandera compartida de "stop" externo -- se llama
+    /// antes de lanzar la busqueda en su propio hilo desde uci_loop.
+    pub fn set_external_stop(&mut self, flag: Option<Arc<AtomicBool>>) {
+        self.external_stop = flag;
     }
 
     fn registrar_corte(&mut self, mv: Move, ply: u32, depth: i32) {
@@ -152,14 +200,6 @@ impl Searcher {
             }
         }
         self.history[mv.from as usize][mv.to as usize] += depth * depth;
-    }
-
-    pub fn clear_tt(&mut self) {
-        for e in self.tt.iter() {
-            *e.lock().unwrap() = None;
-        }
-        self.history = Box::new([[0i32; 64]; 64]);
-        self.game_history.clear();
     }
 
     /// Fija el historial de claves Zobrist de la PARTIDA REAL hasta la
@@ -190,9 +230,18 @@ impl Searcher {
 
     fn check_time(&mut self) -> Result<(), TimeUp> {
         self.nodes += 1;
-        if let Some(dl) = self.deadline {
-            if self.nodes & 1023 == 0 && Instant::now() >= dl {
-                self.stop = true;
+        if !self.stop && self.nodes & 1023 == 0 {
+            if let Some(dl) = self.deadline {
+                if Instant::now() >= dl {
+                    self.stop = true;
+                }
+            }
+            if !self.stop {
+                if let Some(flag) = &self.external_stop {
+                    if flag.load(Ordering::Relaxed) {
+                        self.stop = true;
+                    }
+                }
             }
         }
         if self.stop {
@@ -287,7 +336,7 @@ impl Searcher {
         self.check_time()?;
 
         if b.halfmove_clock >= 100 {
-            return Ok(0);
+            return Ok(draw_score(b));
         }
 
         // Repeticion: si esta posicion ya aparecio entre los ancestros
@@ -302,7 +351,20 @@ impl Searcher {
         if hc > 0 {
             let start = self.path.len().saturating_sub(hc);
             if self.path[start..].contains(&b.zobrist) {
-                return Ok(0);
+                return Ok(draw_score(b));
+            }
+        }
+
+        // Tabla de finales: si la posicion ya esta cubierta (pocas piezas),
+        // el WDL es un resultado EXACTO -- ganada/tablas/perdida bajo juego
+        // perfecto, tratado como "despues de una jugada que reinicia la
+        // regla de 50" (probe_wdl_after_zeroing), la forma segura de usarlo
+        // dentro del arbol de busqueda. No se prueba en la raiz (eso lo
+        // maneja search_time/search_fixed_depth aparte, via DTZ, para elegir
+        // la jugada que progresa de verdad, no solo el resultado).
+        if ply > 0 {
+            if let Some(wdl) = crate::syzygy::probe_wdl(b) {
+                return Ok(wdl);
             }
         }
 
@@ -387,13 +449,17 @@ impl Searcher {
             let sc = if es_reducible && !next.in_check(next.turn) {
                 self.lmr_intentos += 1;
                 let r = 1i32.min(depth - 2);
-                let reducido = -self.negamax(&next, depth - 1 - r, -beta, -alpha, ply + 1)?;
-                if reducido > alpha {
-                    // la reduccion sugiere que podria ser buena: confirmar a profundidad completa
+                // PVS real: el sondeo reducido usa ventana NULA (-alpha-1,-alpha)
+                // -- solo pregunta "esto es mejor que lo que ya tengo?", no
+                // cuanto mejor. Es un bound, no un valor exacto: si supera
+                // alfa, no se confia en el numero, se re-busca a profundidad
+                // Y ventana completas para obtener el valor real.
+                let sondeo = -self.negamax(&next, depth - 1 - r, -alpha - 1, -alpha, ply + 1)?;
+                if sondeo > alpha {
                     self.lmr_reintentos += 1;
                     -self.negamax(&next, depth - 1, -beta, -alpha, ply + 1)?
                 } else {
-                    reducido
+                    sondeo
                 }
             } else {
                 -self.negamax(&next, depth - 1, -beta, -alpha, ply + 1)?
@@ -433,7 +499,7 @@ impl Searcher {
         self.killers = vec![[None, None]; MAX_KILLER_PLY];
         self.path = self.game_history.clone();
         let mut mejor_mv = None;
-        let mut mejor_sc = -INFINITO;
+        let mut mejor_sc: i32 = -INFINITO;
         for d in 1..=depth {
             let moves = generate_legal(b);
             if moves.is_empty() {
@@ -441,28 +507,59 @@ impl Searcher {
             }
             let mut ordered = moves.clone();
             self.order_moves_ply(b, &mut ordered, mejor_mv, 0);
-            let mut alpha = -INFINITO;
-            let mut actual_mv = ordered[0];
-            let mut actual_sc = -INFINITO;
-            self.path.push(b.zobrist);
-            for mv in &ordered {
-                let next = b.make_move(mv);
-                let sc = match self.negamax(&next, d - 1, -INFINITO, -alpha, 1) {
-                    Ok(v) => -v,
-                    Err(_) => {
-                        self.path.pop();
-                        return (mejor_mv.or(Some(actual_mv)), mejor_sc, self.nodes);
-                    }
+
+            const VENTANA_INICIAL: i32 = 50;
+            let (mut vent_alpha, mut vent_beta) =
+                if self.modo_aspiration && d >= 2 && mejor_sc.abs() < MATE - 1000 && mejor_sc > -INFINITO {
+                    (mejor_sc - VENTANA_INICIAL, mejor_sc + VENTANA_INICIAL)
+                } else {
+                    (-INFINITO, INFINITO)
                 };
-                if sc > actual_sc {
-                    actual_sc = sc;
-                    actual_mv = *mv;
+            let mut actual_mv = ordered[0];
+            let mut actual_sc;
+            let mut ancho = VENTANA_INICIAL;
+            loop {
+                let mut alpha = vent_alpha;
+                actual_mv = ordered[0];
+                actual_sc = -INFINITO;
+                self.path.push(b.zobrist);
+                let mut interrumpido = false;
+                for mv in &ordered {
+                    let next = b.make_move(mv);
+                    let sc = match self.negamax(&next, d - 1, -vent_beta, -alpha, 1) {
+                        Ok(v) => -v,
+                        Err(_) => {
+                            interrumpido = true;
+                            break;
+                        }
+                    };
+                    if sc > actual_sc {
+                        actual_sc = sc;
+                        actual_mv = *mv;
+                    }
+                    if sc > alpha {
+                        alpha = sc;
+                    }
+                    if alpha >= vent_beta {
+                        break;
+                    }
                 }
-                if sc > alpha {
-                    alpha = sc;
+                self.path.pop();
+                if interrumpido {
+                    return (mejor_mv.or(Some(actual_mv)), mejor_sc, self.nodes);
                 }
+                if actual_sc <= vent_alpha && vent_alpha > -INFINITO {
+                    ancho = ancho.saturating_mul(2);
+                    vent_alpha = mejor_sc.saturating_sub(ancho).max(-INFINITO);
+                    continue;
+                }
+                if actual_sc >= vent_beta && vent_beta < INFINITO {
+                    ancho = ancho.saturating_mul(2);
+                    vent_beta = mejor_sc.saturating_add(ancho).min(INFINITO);
+                    continue;
+                }
+                break;
             }
-            self.path.pop();
             mejor_mv = Some(actual_mv);
             mejor_sc = actual_sc;
         }
@@ -470,17 +567,34 @@ impl Searcher {
     }
 
     /// Busqueda con presupuesto de tiempo (para UCI "go movetime").
-    pub fn search_time(&mut self, b: &Board, movetime_ms: u64, max_depth: i32, mut on_info: impl FnMut(i32, i32, u64, u64)) -> (Option<Move>, i32, i32) {
+    /// `movetime_ms = None` significa busqueda SIN limite de tiempo propio
+    /// (modo "go infinite"): solo termina por `max_depth`, por encontrar un
+    /// mate, o porque el hilo UCI activa `external_stop` al recibir "stop".
+    pub fn search_time(&mut self, b: &Board, movetime_ms: Option<u64>, max_depth: i32, mut on_info: impl FnMut(i32, i32, u64, u64)) -> (Option<Move>, i32, i32) {
         self.nodes = 0;
         self.stop = false;
         self.killers = vec![[None, None]; MAX_KILLER_PLY];
         self.path = self.game_history.clone();
+
+        // Tabla de finales en la raiz: DTZ da la jugada que progresa de
+        // verdad hacia el resultado optimo (no solo "no perder"), asi que
+        // reemplaza directamente lo que hubiera elegido la busqueda normal
+        // -- sin esto, alfa-beta con WDL exacto en las hojas puede quedar
+        // indiferente entre varias jugadas que dan el mismo resultado
+        // (todas "ganadas"), incluida una que no progresa nunca.
+        if let Some((mv, sc)) = crate::syzygy::mejor_jugada_raiz(b) {
+            on_info(1, sc, 0, 0);
+            return (Some(mv), sc, 1);
+        }
+
         let inicio = Instant::now();
-        let budget = movetime_ms.saturating_sub(30).max(10);
-        self.deadline = Some(inicio + std::time::Duration::from_millis(budget));
+        self.deadline = movetime_ms.map(|ms| {
+            let budget = ms.saturating_sub(30).max(10);
+            inicio + std::time::Duration::from_millis(budget)
+        });
 
         let mut mejor_mv: Option<Move> = None;
-        let mut mejor_sc = 0;
+        let mut mejor_sc: i32 = 0;
         let mut mejor_prof = 0;
 
         for d in 1..=max_depth {
@@ -493,31 +607,72 @@ impl Searcher {
             if self.variante_orden_raiz && ordered.len() >= 2 {
                 ordered.swap(0, 1);
             }
-            let mut alpha = -INFINITO;
+
+            // Aspiration windows: a partir de la 2da profundidad ya hay un
+            // puntaje de referencia (el de la iteracion anterior), asi que en
+            // vez de arrancar con ventana completa (-inf,+inf) se arranca
+            // angosta alrededor de ese valor -- casi siempre alcanza y poda
+            // mucho mas en las subramas, y si falla (la posicion cambio mas
+            // de lo esperado) se ensancha y se repite. Nunca cambia la
+            // jugada final elegida, solo cuanto cuesta encontrarla.
+            const VENTANA_INICIAL: i32 = 50;
+            let (mut vent_alpha, mut vent_beta) = if self.modo_aspiration && d >= 2 && mejor_sc.abs() < MATE - 1000 {
+                (mejor_sc - VENTANA_INICIAL, mejor_sc + VENTANA_INICIAL)
+            } else {
+                (-INFINITO, INFINITO)
+            };
+
             let mut actual_mv = ordered[0];
             let mut actual_sc = -INFINITO;
             let mut timed_out = false;
-            self.path.push(b.zobrist);
-            for mv in &ordered {
-                let next = b.make_move(mv);
-                match self.negamax(&next, d - 1, -INFINITO, -alpha, 1) {
-                    Ok(v) => {
-                        let sc = -v;
-                        if sc > actual_sc {
-                            actual_sc = sc;
-                            actual_mv = *mv;
+            let mut ancho = VENTANA_INICIAL;
+
+            loop {
+                let mut alpha = vent_alpha;
+                actual_mv = ordered[0];
+                actual_sc = -INFINITO;
+                self.path.push(b.zobrist);
+                for mv in &ordered {
+                    let next = b.make_move(mv);
+                    match self.negamax(&next, d - 1, -vent_beta, -alpha, 1) {
+                        Ok(v) => {
+                            let sc = -v;
+                            if sc > actual_sc {
+                                actual_sc = sc;
+                                actual_mv = *mv;
+                            }
+                            if sc > alpha {
+                                alpha = sc;
+                            }
+                            if alpha >= vent_beta {
+                                break; // fail-high contra la ventana: cortar y reintentar mas ancho
+                            }
                         }
-                        if sc > alpha {
-                            alpha = sc;
+                        Err(_) => {
+                            timed_out = true;
+                            break;
                         }
-                    }
-                    Err(_) => {
-                        timed_out = true;
-                        break;
                     }
                 }
+                self.path.pop();
+                if timed_out {
+                    break;
+                }
+                // Ensanchado exponencial (duplica cada reintento) con techo
+                // en ventana completa -- garantiza terminar y converge rapido
+                // incluso si la primera estimacion estaba muy lejos.
+                if actual_sc <= vent_alpha && vent_alpha > -INFINITO {
+                    ancho = ancho.saturating_mul(2);
+                    vent_alpha = mejor_sc.saturating_sub(ancho).max(-INFINITO);
+                    continue;
+                }
+                if actual_sc >= vent_beta && vent_beta < INFINITO {
+                    ancho = ancho.saturating_mul(2);
+                    vent_beta = mejor_sc.saturating_add(ancho).min(INFINITO);
+                    continue;
+                }
+                break; // adentro de la ventana (o ya en ventana completa): valor confiable
             }
-            self.path.pop();
             if timed_out {
                 break;
             }
@@ -529,8 +684,10 @@ impl Searcher {
             if mejor_sc.abs() >= MATE - 1000 {
                 break;
             }
-            if inicio.elapsed().as_millis() as u64 > movetime_ms * 45 / 100 {
-                break;
+            if let Some(ms) = movetime_ms {
+                if inicio.elapsed().as_millis() as u64 > ms * 45 / 100 {
+                    break;
+                }
             }
         }
         (mejor_mv, mejor_sc, mejor_prof)
@@ -567,15 +724,19 @@ pub struct ResultadoHilo {
 /// plies, una desventaja injusta frente a la version de un solo hilo.
 pub fn buscar_lazy_smp(
     b: &Board,
-    movetime_ms: u64,
+    movetime_ms: Option<u64>,
     max_depth: i32,
     n_hilos: usize,
     tt: &Arc<SharedTT>,
     tt_mask: usize,
     modo_lmr: bool,
+    game_history: &[u64],
+    external_stop: Arc<AtomicBool>,
 ) -> (Option<Move>, i32, u64, Vec<ResultadoHilo>) {
     if n_hilos <= 1 {
         let mut s = Searcher::new_con_tt_compartida(Arc::clone(tt), tt_mask, modo_lmr);
+        s.set_external_stop(Some(external_stop));
+        s.set_game_history(game_history.to_vec());
         let (mv, sc, prof) = s.search_time(b, movetime_ms, max_depth, |_, _, _, _| {});
         let nodos = s.nodes;
         return (mv, sc, nodos, vec![ResultadoHilo { mv, score: sc, profundidad: prof, nodos }]);
@@ -585,10 +746,14 @@ pub fn buscar_lazy_smp(
 
     let handles: Vec<_> = (0..n_hilos)
         .map(|i| {
+            let external_stop = Arc::clone(&external_stop);
             let tt = Arc::clone(tt);
+            let game_history = game_history.to_vec();
             std::thread::spawn(move || {
                 let mut s = Searcher::new_con_tt_compartida(tt, tt_mask, modo_lmr);
                 s.variante_orden_raiz = i % 2 == 1;
+                s.set_external_stop(Some(external_stop));
+                s.set_game_history(game_history);
                 let (mv, sc, prof) = s.search_time(&board_copy, movetime_ms, max_depth, |_, _, _, _| {});
                 ResultadoHilo { mv, score: sc, profundidad: prof, nodos: s.nodes }
             })

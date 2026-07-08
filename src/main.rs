@@ -5,6 +5,7 @@ mod movegen;
 mod perft;
 mod search;
 mod see;
+mod syzygy;
 mod types;
 mod zobrist;
 
@@ -12,6 +13,8 @@ use board::Board;
 use search::Searcher;
 use std::env;
 use std::io::{self, BufRead, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 use types::{Move, MoveFlag, PieceType};
 
@@ -70,7 +73,9 @@ fn run_smp_bench(movetime_ms: u64) {
     for n in [1usize, 2, 4, 6, 8] {
         let (tt, tt_mask) = search::construir_tt(64);
         let t0 = Instant::now();
-        let (mv, sc, nodos, resultados) = search::buscar_lazy_smp(&b, movetime_ms, 64, n, &tt, tt_mask, false);
+        let (mv, sc, nodos, resultados) = search::buscar_lazy_smp(
+            &b, Some(movetime_ms), 64, n, &tt, tt_mask, false, &[], Arc::new(AtomicBool::new(false)),
+        );
         let dt = t0.elapsed();
         let nps = nodos as f64 / dt.as_secs_f64().max(0.0001);
         let profs: Vec<i32> = resultados.iter().map(|r| r.profundidad).collect();
@@ -388,16 +393,61 @@ fn run_see_tests() {
     );
 }
 
+/// Handle de una busqueda corriendo en su propio hilo (spawneada al recibir
+/// "go") + la bandera compartida para pedirle que pare ("stop"). El hilo
+/// devuelve el Searcher de un solo hilo si lo tomo prestado (para
+/// recuperarlo y seguir usandolo en la siguiente jugada), o None si la
+/// busqueda fue Lazy SMP (esos Searchers son desechables, no hay uno
+/// persistente que recuperar -- solo la TT compartida, que vive aparte).
+struct BusquedaActiva {
+    handle: std::thread::JoinHandle<Option<Searcher>>,
+    stop_flag: Arc<AtomicBool>,
+}
+
+/// Si hay una busqueda en curso, le pide que pare y espera a que termine
+/// (casi instantaneo: el hilo de busqueda revisa la bandera cada 1024 nodos)
+/// para recuperar el Searcher de un solo hilo, si corresponde. Se llama
+/// defensivamente antes de procesar cualquier comando UCI que no sea
+/// "isready" -- un GUI que cumple el protocolo siempre manda "stop" antes de
+/// "position"/"go"/"ucinewgame" nuevos, pero esto evita un panic si alguno
+/// no lo hace.
+fn detener_y_recuperar(activa: &mut Option<BusquedaActiva>, searcher_slot: &mut Option<Searcher>) {
+    if let Some(a) = activa.take() {
+        a.stop_flag.store(true, Ordering::Relaxed);
+        if let Ok(Some(s)) = a.handle.join() {
+            *searcher_slot = Some(s);
+        }
+    }
+}
+
 fn uci_loop() {
     let stdin = io::stdin();
     let mut board = Board::from_fen(STARTPOS).unwrap();
-    let mut searcher = Searcher::new(64);
+    let mut tt_mb: usize = 64;
+    let mut searcher_slot: Option<Searcher> = Some(Searcher::new(tt_mb));
     let mut game_history: Vec<u64> = Vec::new();
-    let n_hilos: usize = std::env::var("MIMOTOR_HILOS").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
+    // MIMOTOR_HILOS sigue funcionando como default de conveniencia para
+    // pruebas locales, pero un tester UCI (CCRL y similares) SOLO configura
+    // motores por "setoption", nunca por variables de entorno -- por eso
+    // "Threads" tambien es una opcion UCI real (ver abajo) que sobreescribe
+    // este valor inicial.
+    let mut n_hilos: usize = std::env::var("MIMOTOR_HILOS").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
+    if let Ok(p) = std::env::var("MIMOTOR_PERSONALIDAD") {
+        if let Some(pers) = eval::personalidad_desde_texto(&p) {
+            eval::set_personalidad(pers);
+        }
+    }
+    if let Ok(path) = std::env::var("MIMOTOR_SYZYGY_PATH") {
+        match syzygy::init(&path) {
+            Ok(max) => eprintln!("info string tablas Syzygy cargadas ({} piezas max)", max),
+            Err(e) => eprintln!("info string error cargando tablas Syzygy: {}", e),
+        }
+    }
     // TT compartida persistente para Lazy SMP -- se construye una sola vez y
     // se reutiliza entre jugadas de la partida (igual que la TT normal de
     // un Searcher), no se reconstruye en cada "go".
-    let (smp_tt, smp_tt_mask) = search::construir_tt(64);
+    let (mut smp_tt, mut smp_tt_mask) = search::construir_tt(tt_mb);
+    let mut activa: Option<BusquedaActiva> = None;
 
     for line in stdin.lock().lines() {
         let line = match line {
@@ -409,25 +459,75 @@ fn uci_loop() {
             continue;
         }
         let partes: Vec<&str> = line.split_whitespace().collect();
+
+        // "stop" y "isready" se manejan aparte (no deben esperar a que se
+        // libere una busqueda en curso). Todo lo demas primero se asegura de
+        // que no haya una busqueda activa antes de tocar board/searcher.
+        if partes[0] == "stop" {
+            detener_y_recuperar(&mut activa, &mut searcher_slot);
+            continue;
+        }
+        if partes[0] == "isready" {
+            println!("readyok");
+            io::stdout().flush().ok();
+            continue;
+        }
+        detener_y_recuperar(&mut activa, &mut searcher_slot);
+
         match partes[0] {
             "uci" => {
-                println!("id name MiMotor Tal v6 (Rust)");
+                println!("id name MiMotor Tal v7 (Rust)");
                 println!("id author Tavito y Claude");
                 println!("option name Hash type spin default 64 min 1 max 1024");
+                println!("option name Threads type spin default {} min 1 max 16", n_hilos);
+                println!("option name Personalidad type combo default tal var tal var universal");
+                println!("option name SyzygyPath type string default <empty>");
                 println!("uciok");
                 io::stdout().flush().ok();
             }
-            "isready" => {
-                println!("readyok");
+            "setoption" => {
+                if let Some(ni) = partes.iter().position(|&p| p == "name") {
+                    let nombre = partes.get(ni + 1).copied().unwrap_or("");
+                    let vi = partes.iter().position(|&p| p == "value");
+                    let valor = vi.and_then(|j| partes.get(j + 1)).copied();
+                    if nombre.eq_ignore_ascii_case("personalidad") {
+                        if let Some(valor) = valor {
+                            if let Some(pers) = eval::personalidad_desde_texto(valor) {
+                                eval::set_personalidad(pers);
+                            } else {
+                                println!("info string valor de Personalidad invalido: {}", valor);
+                            }
+                        }
+                    } else if nombre.eq_ignore_ascii_case("hash") {
+                        if let Some(mb) = valor.and_then(|v| v.parse::<usize>().ok()) {
+                            // El nuevo tamano se aplica recien en el proximo
+                            // "ucinewgame" (igual que la mayoria de los motores
+                            // UCI: cambiar el tamano de una TT compartida a
+                            // mitad de partida no es seguro ni tiene sentido).
+                            tt_mb = mb.clamp(1, 1024);
+                        }
+                    } else if nombre.eq_ignore_ascii_case("threads") {
+                        if let Some(n) = valor.and_then(|v| v.parse::<usize>().ok()) {
+                            n_hilos = n.clamp(1, 16);
+                        }
+                    } else if nombre.eq_ignore_ascii_case("syzygypath") {
+                        if let Some(path) = valor {
+                            match syzygy::init(path) {
+                                Ok(max) => println!("info string tablas Syzygy cargadas ({} piezas max)", max),
+                                Err(e) => println!("info string error cargando tablas Syzygy: {}", e),
+                            }
+                        }
+                    }
+                }
                 io::stdout().flush().ok();
             }
             "ucinewgame" => {
                 board = Board::from_fen(STARTPOS).unwrap();
-                searcher.clear_tt();
                 game_history.clear();
-                for e in smp_tt.iter() {
-                    *e.lock().unwrap() = None;
-                }
+                searcher_slot = Some(Searcher::new(tt_mb));
+                let (nueva_tt, nueva_mask) = search::construir_tt(tt_mb);
+                smp_tt = nueva_tt;
+                smp_tt_mask = nueva_mask;
             }
             "position" => {
                 let mut idx = 1;
@@ -460,41 +560,96 @@ fn uci_loop() {
                 }
             }
             "go" => {
-                searcher.set_game_history(game_history.clone());
-                let mut movetime: u64 = 2000;
-                if let Some(i) = partes.iter().position(|&p| p == "movetime") {
-                    movetime = partes.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(2000);
-                } else if let Some(i) = partes.iter().position(|&p| p == "depth") {
+                let infinito = partes.iter().any(|&p| p == "infinite");
+                if let Some(i) = partes.iter().position(|&p| p == "depth") {
                     let depth: i32 = partes.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(6);
-                    let (mv, sc, _) = searcher.search_fixed_depth(&board, depth);
-                    println!("info score cp {}", sc);
-                    println!("bestmove {}", mv.map(|m| m.to_uci()).unwrap_or_else(|| "0000".to_string()));
-                    io::stdout().flush().ok();
-                    continue;
-                } else if let Some(i) = partes.iter().position(|&p| p == "wtime") {
-                    let wtime: i64 = partes.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(10000);
-                    let btime_i = partes.iter().position(|&p| p == "btime");
-                    let btime: i64 = btime_i.and_then(|j| partes.get(j + 1)).and_then(|s| s.parse().ok()).unwrap_or(10000);
-                    let mio = if board.turn == types::Color::White { wtime } else { btime };
-                    movetime = ((mio / 30).max(50)) as u64;
-                }
-                let mv = if n_hilos > 1 {
-                    let (mv, sc, nodos, _) = search::buscar_lazy_smp(&board, movetime, 64, n_hilos, &smp_tt, smp_tt_mask, searcher.modo_lmr);
-                    println!("info score cp {} nodes {}", sc, nodos);
-                    io::stdout().flush().ok();
-                    mv
-                } else {
-                    let (mv, sc, _) = searcher.search_time(&board, movetime, 64, |depth, score, nodes, ms| {
-                        println!("info depth {} score cp {} nodes {} time {}", depth, score, nodes, ms);
+                    let mut s = searcher_slot.take().unwrap();
+                    s.set_game_history(game_history.clone());
+                    let stop_flag = Arc::new(AtomicBool::new(false));
+                    s.set_external_stop(Some(Arc::clone(&stop_flag)));
+                    let board_copy = board;
+                    let handle = std::thread::spawn(move || {
+                        let (mv, sc, _) = s.search_fixed_depth(&board_copy, depth);
+                        println!("info score cp {}", sc);
+                        println!("bestmove {}", mv.map(|m| m.to_uci()).unwrap_or_else(|| "0000".to_string()));
                         io::stdout().flush().ok();
+                        Some(s)
                     });
-                    let _ = sc;
-                    mv
-                };
-                println!("bestmove {}", mv.map(|m| m.to_uci()).unwrap_or_else(|| "0000".to_string()));
-                io::stdout().flush().ok();
+                    activa = Some(BusquedaActiva { handle, stop_flag });
+                    continue;
+                }
+
+                // movetime explicito, o wtime/btime(+winc/binc/movestogo), o
+                // "go infinite" (sin limite propio, corta solo con "stop").
+                let mut movetime: Option<u64> = None;
+                if let Some(i) = partes.iter().position(|&p| p == "movetime") {
+                    movetime = partes.get(i + 1).and_then(|s| s.parse().ok());
+                } else if !infinito {
+                    if let Some(i) = partes.iter().position(|&p| p == "wtime") {
+                        let wtime: i64 = partes.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(10000);
+                        let btime_i = partes.iter().position(|&p| p == "btime");
+                        let btime: i64 = btime_i.and_then(|j| partes.get(j + 1)).and_then(|s| s.parse().ok()).unwrap_or(10000);
+                        let winc: i64 = partes.iter().position(|&p| p == "winc")
+                            .and_then(|j| partes.get(j + 1)).and_then(|s| s.parse().ok()).unwrap_or(0);
+                        let binc: i64 = partes.iter().position(|&p| p == "binc")
+                            .and_then(|j| partes.get(j + 1)).and_then(|s| s.parse().ok()).unwrap_or(0);
+                        let movestogo: i64 = partes.iter().position(|&p| p == "movestogo")
+                            .and_then(|j| partes.get(j + 1)).and_then(|s| s.parse().ok()).unwrap_or(30);
+                        let (mio, inc) = if board.turn == types::Color::White { (wtime, winc) } else { (btime, binc) };
+                        // Reparto clasico: tiempo restante / jugadas que quedan
+                        // hasta el proximo control, mas la mayor parte del
+                        // incremento (dejando margen para no pasarse de largo).
+                        // Techo de 60s: con relojes de correspondencia (dias
+                        // de tiempo base) esta formula podria salir en horas --
+                        // sin un plan especifico para partidas tan largas, es
+                        // mas seguro limitar el pensamiento por jugada que
+                        // arriesgarse a quedar calculando indefinidamente.
+                        let base = mio / movestogo.max(1);
+                        movetime = Some(((base + inc * 8 / 10).max(50) as u64).min(3_500));
+                    } else {
+                        movetime = Some(2000); // "go" sin ningun parametro de tiempo: default razonable
+                    }
+                }
+
+                let stop_flag = Arc::new(AtomicBool::new(false));
+                let board_copy = board;
+                let hist_copy = game_history.clone();
+
+                if n_hilos > 1 {
+                    let modo_lmr = searcher_slot.as_ref().unwrap().modo_lmr;
+                    let tt = Arc::clone(&smp_tt);
+                    let mask = smp_tt_mask;
+                    let flag = Arc::clone(&stop_flag);
+                    let handle = std::thread::spawn(move || {
+                        let (mv, sc, nodos, _) = search::buscar_lazy_smp(
+                            &board_copy, movetime, 64, n_hilos, &tt, mask, modo_lmr, &hist_copy, flag,
+                        );
+                        println!("info score cp {} nodes {}", sc, nodos);
+                        println!("bestmove {}", mv.map(|m| m.to_uci()).unwrap_or_else(|| "0000".to_string()));
+                        io::stdout().flush().ok();
+                        None
+                    });
+                    activa = Some(BusquedaActiva { handle, stop_flag });
+                } else {
+                    let mut s = searcher_slot.take().unwrap();
+                    s.set_game_history(hist_copy);
+                    s.set_external_stop(Some(Arc::clone(&stop_flag)));
+                    let handle = std::thread::spawn(move || {
+                        let (mv, _sc, _) = s.search_time(&board_copy, movetime, 64, |depth, score, nodes, ms| {
+                            println!("info depth {} score cp {} nodes {} time {}", depth, score, nodes, ms);
+                            io::stdout().flush().ok();
+                        });
+                        println!("bestmove {}", mv.map(|m| m.to_uci()).unwrap_or_else(|| "0000".to_string()));
+                        io::stdout().flush().ok();
+                        Some(s)
+                    });
+                    activa = Some(BusquedaActiva { handle, stop_flag });
+                }
             }
-            "quit" => break,
+            "quit" => {
+                detener_y_recuperar(&mut activa, &mut searcher_slot);
+                break;
+            }
             _ => {}
         }
     }

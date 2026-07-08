@@ -8,14 +8,47 @@ use crate::bitboard::{
 };
 use crate::board::Board;
 use crate::types::{file_of, make_square, rank_of, Color, PieceType, Square};
+use std::sync::atomic::{AtomicU8, Ordering};
+
+// Dos identidades de evaluacion, seleccionables en caliente (UCI "setoption
+// name Personalidad" o variable de entorno MIMOTOR_PERSONALIDAD), que
+// COEXISTEN -- no se reemplaza Tal, se agrega Universal como alternativa.
+// Estado global de solo-lectura durante la busqueda (se fija antes de "go",
+// nunca cambia a mitad de una busqueda concurrente) -- por eso un atomico
+// simple alcanza, sin necesitar pasar el parametro por cada llamada interna.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Personalidad {
+    Tal,
+    Universal,
+}
+
+static PERSONALIDAD_ACTUAL: AtomicU8 = AtomicU8::new(0);
+
+pub fn set_personalidad(p: Personalidad) {
+    PERSONALIDAD_ACTUAL.store(if p == Personalidad::Universal { 1 } else { 0 }, Ordering::Relaxed);
+}
+
+pub fn personalidad_desde_texto(s: &str) -> Option<Personalidad> {
+    match s.to_lowercase().as_str() {
+        "tal" => Some(Personalidad::Tal),
+        "universal" => Some(Personalidad::Universal),
+        _ => None,
+    }
+}
+
+fn personalidad_actual() -> Personalidad {
+    if PERSONALIDAD_ACTUAL.load(Ordering::Relaxed) == 1 { Personalidad::Universal } else { Personalidad::Tal }
+}
 
 const VALOR: [i32; 6] = [100, 320, 330, 500, 900, 0]; // Pawn,Knight,Bishop,Rook,Queen,King
-const ESCALA_MATERIAL: f64 = 0.9;
+const ESCALA_MATERIAL_TAL: f64 = 0.9;
+const ESCALA_MATERIAL_UNIVERSAL: f64 = 1.0;
 const TEMPO: i32 = 12;
 
 const PESO_MOV: [i32; 6] = [0, 4, 4, 3, 1, 0];
 const PESO_ATQ: [i32; 6] = [0, 2, 2, 3, 5, 0];
-const FACTOR_ATAQUE: f64 = 1.45;
+const FACTOR_ATAQUE_TAL: f64 = 1.45;
+const FACTOR_ATAQUE_UNIVERSAL: f64 = 1.0; // ataque al rey de peso normal, sin el bono no-lineal agresivo de Tal
 
 const TABLA_SEGURIDAD: [i32; 62] = [
     0, 0, 1, 2, 3, 5, 7, 9, 12, 15, 18, 22, 26, 30, 35, 39, 44, 50, 56, 62, 68, 75, 82, 85, 89,
@@ -146,6 +179,70 @@ fn piece_attacks(pt: PieceType, sq: Square, occ: Bitboard, color: Color) -> Bitb
     }
 }
 
+fn distancia_chebyshev(a: Square, b: Square) -> i32 {
+    let (fa, ra) = (file_of(a) as i32, rank_of(a) as i32);
+    let (fb, rb) = (file_of(b) as i32, rank_of(b) as i32);
+    (fa - fb).abs().max((ra - rb).abs())
+}
+
+// Indice de avance hacia la coronacion (0 = fila de salida, 7 = coronando),
+// independiente del color: para blancas es directamente rank_of, para negras
+// es la fila espejada.
+fn indice_avance(color: Color, sq: Square) -> usize {
+    let r = rank_of(sq) as usize;
+    if color == Color::White { r } else { 7 - r }
+}
+
+// Peon pasado: ningun peon rival en la misma columna ni en las adyacentes,
+// por delante de esta casilla en direccion a la coronacion. Se calcula con
+// mascaras de fila/columna en vez de generar el tablero completo -- barato,
+// se llama una vez por peon en cada evaluacion.
+fn es_pasado(color: Color, sq: Square, peones_rivales: Bitboard) -> bool {
+    let f = file_of(sq) as i32;
+    let r = rank_of(sq) as i32;
+    let mut columnas: Bitboard = 0;
+    for df in -1..=1i32 {
+        let nf = f + df;
+        if (0..8).contains(&nf) {
+            columnas |= 0x0101010101010101u64 << nf;
+        }
+    }
+    let filas_delante: Bitboard = if color == Color::White {
+        if r == 7 { 0 } else { !0u64 << ((r + 1) * 8) }
+    } else if r == 0 {
+        0
+    } else {
+        !(!0u64 << (r * 8))
+    };
+    (peones_rivales & columnas & filas_delante) == 0
+}
+
+const PASO_BONUS: [i32; 8] = [0, 5, 10, 20, 35, 60, 100, 150];
+const VENTAJA_DECISIVA: f64 = 500.0; // ~una torre de diferencia
+const PESO_ACERCAMIENTO_REY: f64 = 4.0;
+
+// Puesto avanzado (profilaxis, solo personalidad Universal): pieza menor
+// propia en territorio rival que ningun peon rival puede llegar a atacar
+// nunca (mismo patron de mascara que un peon pasado, pero mirando si HAY
+// peones rivales adelante en columnas adyacentes, no si NO los hay). Premia
+// restringir el territorio del rival, no solo maximizar la movilidad propia
+// -- una pieza asi no se puede expulsar con un peon, limita permanentemente
+// los planes del rival en esa zona del tablero.
+fn en_territorio_rival(color: Color, sq: Square) -> bool {
+    let r = rank_of(sq);
+    if color == Color::White { r >= 4 } else { r <= 3 }
+}
+
+fn puesto_avanzado_seguro(color: Color, sq: Square, peones_rivales: Bitboard) -> bool {
+    es_pasado(color, sq, peones_rivales) // misma mascara: sin peon rival por delante en columnas adyacentes
+}
+
+const BONUS_PUESTO: [i32; 6] = [0, 25, 12, 0, 0, 0]; // solo caballo/alfil
+
+fn pareja_alfiles_bonus(color: Color, b: &Board) -> f64 {
+    if popcount(b.pieces[color as usize][PieceType::Bishop as usize]) >= 2 { 35.0 } else { 0.0 }
+}
+
 fn king_zone(ksq: Square, color: Color) -> Bitboard {
     let mut z = king_attacks(ksq) | (1u64 << ksq);
     let f = file_of(ksq) as i32;
@@ -166,7 +263,7 @@ struct AtaqueRey {
     ataque_b: f64,
 }
 
-fn calcular_ataque_rey(b: &Board) -> AtaqueRey {
+fn calcular_ataque_rey(b: &Board, factor_ataque: f64) -> AtaqueRey {
     let rey_w = b.king_square(Color::White);
     let rey_b = b.king_square(Color::Black);
     let zona_w = king_zone(rey_w, Color::White);
@@ -206,7 +303,7 @@ fn calcular_ataque_rey(b: &Board) -> AtaqueRey {
         if !tiene_dama {
             u /= 2;
         }
-        let mut s = TABLA_SEGURIDAD[u.min(61) as usize] as f64 * FACTOR_ATAQUE;
+        let mut s = TABLA_SEGURIDAD[u.min(61) as usize] as f64 * factor_ataque;
         if n_atacantes[idx] < 2 {
             s *= 0.35;
         }
@@ -222,6 +319,17 @@ fn calcular_ataque_rey(b: &Board) -> AtaqueRey {
 }
 
 pub fn evaluate(b: &Board) -> i32 {
+    let pers = personalidad_actual();
+    let es_universal = pers == Personalidad::Universal;
+    let escala_material = if es_universal { ESCALA_MATERIAL_UNIVERSAL } else { ESCALA_MATERIAL_TAL };
+    let factor_ataque = if es_universal { FACTOR_ATAQUE_UNIVERSAL } else { FACTOR_ATAQUE_TAL };
+    // Universal castiga mas la estructura de peones rota (filosofia tecnica
+    // clasica); Tal la castiga poco a proposito, para no desalentar sacrificios.
+    let peso_estructura: i32 = if es_universal { 16 } else { 8 };
+    // Universal se apoya mas en la tecnica de finales (rey activo, peones
+    // pasados, torres activas) ya que esa es literalmente su identidad.
+    let peso_final_extra: f64 = if es_universal { 1.3 } else { 1.0 };
+
     let occ_w = b.occupied_co[Color::White as usize];
     let occ_b = b.occupied_co[Color::Black as usize];
 
@@ -271,18 +379,18 @@ pub fn evaluate(b: &Board) -> i32 {
         let cb = popcount(pb & fm) as i32;
         if cw > 0 {
             if cw > 1 {
-                estructura[1] -= 8 * (cw - 1);
+                estructura[1] -= peso_estructura * (cw - 1);
             }
             if pw & adyacentes == 0 {
-                estructura[1] -= 8 * cw;
+                estructura[1] -= peso_estructura * cw;
             }
         }
         if cb > 0 {
             if cb > 1 {
-                estructura[0] -= 8 * (cb - 1);
+                estructura[0] -= peso_estructura * (cb - 1);
             }
             if pb & adyacentes == 0 {
-                estructura[0] -= 8 * cb;
+                estructura[0] -= peso_estructura * cb;
             }
         }
     }
@@ -312,30 +420,137 @@ pub fn evaluate(b: &Board) -> i32 {
     let escudo_w = escudo(rey_w, Color::White, pw) as f64 * mgf;
     let escudo_b = escudo(rey_b, Color::Black, pb) as f64 * mgf;
 
-    let ar = calcular_ataque_rey(b);
+    let ar = calcular_ataque_rey(b, factor_ataque);
 
-    // Mantener piezas de ataque cuando hay iniciativa
-    let mut extra = 0i32;
-    if ar.ataque_w - ar.ataque_b > 60.0 {
-        if b.pieces[Color::White as usize][PieceType::Queen as usize] & occ_w != 0 {
-            extra += 30;
+    // Peones pasados: bono creciente por avance, reforzado por escolta del
+    // rey propio (mas cerca de la casilla de coronacion que el rey rival) y
+    // a plena fuerza en el final -- en medio juego pesa la mitad porque
+    // todavia no es facil de convertir con piezas en el tablero.
+    let mut pasados = [0.0f64; 2];
+    for (color, idx, propios, rivales) in [(Color::White, 1usize, pw, pb), (Color::Black, 0usize, pb, pw)] {
+        let mut bb = propios;
+        while bb != 0 {
+            let sq = crate::bitboard::pop_lsb(&mut bb);
+            if es_pasado(color, sq, rivales) {
+                let base = PASO_BONUS[indice_avance(color, sq)] as f64;
+                let mut bono = base * (0.5 + 0.5 * egf);
+                let casilla_coronacion = if color == Color::White {
+                    make_square(file_of(sq), 7)
+                } else {
+                    make_square(file_of(sq), 0)
+                };
+                let (rey_propio, rey_rival) =
+                    if color == Color::White { (rey_w, rey_b) } else { (rey_b, rey_w) };
+                let dist_propio = distancia_chebyshev(rey_propio, casilla_coronacion);
+                let dist_rival = distancia_chebyshev(rey_rival, casilla_coronacion);
+                bono += (dist_rival - dist_propio) as f64 * 3.0 * egf;
+                pasados[idx] += bono;
+            }
         }
-        extra += 8 * popcount(b.pieces[Color::White as usize][PieceType::Rook as usize] & occ_w).min(2) as i32;
-    } else if ar.ataque_b - ar.ataque_w > 60.0 {
-        if b.pieces[Color::Black as usize][PieceType::Queen as usize] & occ_b != 0 {
-            extra -= 30;
-        }
-        extra -= 8 * popcount(b.pieces[Color::Black as usize][PieceType::Rook as usize] & occ_b).min(2) as i32;
     }
 
-    let total = (mat[1] - mat[0]) as f64 * ESCALA_MATERIAL
+    // Torres en la 7ma fila (2da del rival) y en columnas abiertas/semi-
+    // abiertas: mucho mas activas ahi, sobre todo en finales de torres.
+    let mut torres_activas = [0.0f64; 2];
+    for (color, idx, propios, rivales) in [(Color::White, 1usize, pw, pb), (Color::Black, 0usize, pb, pw)] {
+        let mut bb = b.pieces[color as usize][PieceType::Rook as usize];
+        while bb != 0 {
+            let sq = crate::bitboard::pop_lsb(&mut bb);
+            let r = rank_of(sq);
+            let en_7ma = if color == Color::White { r == 6 } else { r == 1 };
+            if en_7ma {
+                torres_activas[idx] += 20.0;
+            }
+            let f = file_of(sq);
+            let columna: Bitboard = 0x0101010101010101u64 << f;
+            let hay_propio = propios & columna != 0;
+            let hay_rival = rivales & columna != 0;
+            if !hay_propio && !hay_rival {
+                torres_activas[idx] += 15.0;
+            } else if !hay_propio {
+                torres_activas[idx] += 8.0;
+            }
+        }
+    }
+
+    // Actividad de rey en finales con ventaja decisiva: cuando el material
+    // ya alcanza para ganar (mas de una torre de diferencia), el objetivo
+    // deja de ser "no arriesgar" y pasa a "progresar" -- se premia que el
+    // rey del bando que gana se acerque al rey rival (tecnica clasica de
+    // conversion). Solo pesa en el final (egf) y solo del lado que gana.
+    let dif_material = (mat[1] - mat[0]) as f64 * escala_material;
+    let cierre_rey = if dif_material > VENTAJA_DECISIVA {
+        (7 - distancia_chebyshev(rey_w, rey_b)) as f64 * PESO_ACERCAMIENTO_REY * egf
+    } else if dif_material < -VENTAJA_DECISIVA {
+        -((7 - distancia_chebyshev(rey_w, rey_b)) as f64 * PESO_ACERCAMIENTO_REY * egf)
+    } else {
+        0.0
+    };
+
+    // Bloque especifico de personalidad: Tal mantiene piezas de ataque
+    // cuando hay iniciativa (identidad agresiva/sacrificial); Universal en
+    // cambio busca pareja de alfiles, restringe al rival con puestos
+    // avanzados seguros (profilaxis) y prefiere SIMPLIFICAR hacia un final
+    // ganado en vez de retener piezas de ataque -- tecnica de conversion
+    // clasica, coherente con el bloque de finales de arriba.
+    let mut extra = 0.0f64;
+    if !es_universal {
+        if ar.ataque_w - ar.ataque_b > 60.0 {
+            if b.pieces[Color::White as usize][PieceType::Queen as usize] & occ_w != 0 {
+                extra += 30.0;
+            }
+            extra += 8.0 * popcount(b.pieces[Color::White as usize][PieceType::Rook as usize] & occ_w).min(2) as f64;
+        } else if ar.ataque_b - ar.ataque_w > 60.0 {
+            if b.pieces[Color::Black as usize][PieceType::Queen as usize] & occ_b != 0 {
+                extra -= 30.0;
+            }
+            extra -= 8.0 * popcount(b.pieces[Color::Black as usize][PieceType::Rook as usize] & occ_b).min(2) as f64;
+        }
+    } else {
+        extra += pareja_alfiles_bonus(Color::White, b) - pareja_alfiles_bonus(Color::Black, b);
+
+        for (color, signo, rivales) in [(Color::White, 1.0f64, pb), (Color::Black, -1.0f64, pw)] {
+            for pt in [PieceType::Knight, PieceType::Bishop] {
+                let mut bb = b.pieces[color as usize][pt as usize];
+                while bb != 0 {
+                    let sq = crate::bitboard::pop_lsb(&mut bb);
+                    if en_territorio_rival(color, sq) && puesto_avanzado_seguro(color, sq, rivales) {
+                        extra += signo * BONUS_PUESTO[pt as usize] as f64;
+                    }
+                }
+            }
+        }
+
+        // Simplificar hacia un final ganado: cuando ya se esta claramente
+        // mejor, cada pieza mayor/menor menos en el tablero (de cualquier
+        // bando) es progreso hacia la conversion -- lo opuesto de "retener
+        // piezas de ataque". Solo pesa si la ventaja ya es significativa
+        // (no en posiciones parejas, donde cambiar piezas no tiene un signo
+        // claro) y crece hacia el final (mgf bajo).
+        let piezas_no_peon = crate::types::ALL_PIECE_TYPES
+            .iter()
+            .filter(|&&pt| pt != PieceType::Pawn && pt != PieceType::King)
+            .map(|&pt| popcount(b.pieces[0][pt as usize] | b.pieces[1][pt as usize]))
+            .sum::<u32>() as f64;
+        const UMBRAL_SIMPLIFICACION: f64 = 150.0;
+        if dif_material > UMBRAL_SIMPLIFICACION {
+            extra += (10.0 - piezas_no_peon) * 2.0 * (0.4 + 0.6 * egf);
+        } else if dif_material < -UMBRAL_SIMPLIFICACION {
+            extra -= (10.0 - piezas_no_peon) * 2.0 * (0.4 + 0.6 * egf);
+        }
+    }
+
+    let total = (mat[1] - mat[0]) as f64 * escala_material
         + (pst_mg_sum[1] - pst_mg_sum[0]) as f64 * mgf
         + (pst_eg_sum[1] - pst_eg_sum[0]) as f64 * egf
         + (movilidad[1] - movilidad[0]) as f64
         + (ar.ataque_w - ar.ataque_b)
         + (estructura[1] - estructura[0]) as f64
         + (escudo_w - escudo_b)
-        + extra as f64;
+        + (pasados[1] - pasados[0]) * peso_final_extra
+        + (torres_activas[1] - torres_activas[0]) * peso_final_extra
+        + cierre_rey * peso_final_extra
+        + extra;
 
     let total_i = total.round() as i32;
     let perspectiva = if b.turn == Color::White { total_i } else { -total_i };
