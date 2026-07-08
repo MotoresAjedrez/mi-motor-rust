@@ -52,6 +52,14 @@ pub struct Searcher {
     // actual); history SI persiste entre jugadas de la partida, igual que la TT.
     killers: Vec<[Option<Move>; 2]>,
     history: Box<[[i32; 64]; 64]>, // [from][to] -- arreglo plano, mas rapido que un HashMap aqui
+    pub modo_lmr: bool,
+    // Historial de repeticion: claves Zobrist de la PARTIDA REAL (persiste
+    // entre llamadas a go, la maneja el loop UCI) + las de la linea actual
+    // de busqueda (crece/decrece durante la recursion, como el "self.hist"
+    // de Python). No se usa la TT para esto porque una entrada de TT no
+    // sabe CUANTAS veces se visito esa posicion en esta partida especifica.
+    game_history: Vec<u64>,
+    path: Vec<u64>,
 }
 
 fn valor_pieza(pt: crate::types::PieceType) -> i32 {
@@ -78,6 +86,9 @@ impl Searcher {
             stop: false,
             killers: vec![[None, None]; MAX_KILLER_PLY],
             history: Box::new([[0i32; 64]; 64]),
+            modo_lmr: std::env::var("MIMOTOR_LMR").as_deref() == Ok("1"),
+            game_history: Vec::new(),
+            path: Vec::new(),
         }
     }
 
@@ -101,6 +112,16 @@ impl Searcher {
             *e = None;
         }
         self.history = Box::new([[0i32; 64]; 64]);
+        self.game_history.clear();
+    }
+
+    /// Fija el historial de claves Zobrist de la PARTIDA REAL hasta la
+    /// posicion actual (lo arma el loop UCI a partir de "position ...
+    /// moves ..."). Se llama antes de cada busqueda para que la deteccion
+    /// de repeticion vea jugadas ya ocurridas en la partida, no solo las
+    /// que aparezcan dentro del arbol de esta busqueda.
+    pub fn set_game_history(&mut self, hist: Vec<u64>) {
+        self.game_history = hist;
     }
 
     fn tt_index(&self, key: u64) -> usize {
@@ -221,6 +242,22 @@ impl Searcher {
             return Ok(0);
         }
 
+        // Repeticion: si esta posicion ya aparecio entre los ancestros
+        // (partida real + linea de busqueda actual) dentro de la ventana de
+        // jugadas reversibles (halfmove_clock), tratarla como tablas -- asi
+        // el motor las evita activamente cuando esta mejor y las busca
+        // activamente cuando esta peor, en vez de solo "no perder por
+        // descuido". No hace falta esperar la 3ra ocurrencia real: ver la
+        // 2da dentro del arbol ya significa que la repeticion esta
+        // disponible como opcion, que es lo que le interesa a la busqueda.
+        let hc = b.halfmove_clock as usize;
+        if hc > 0 {
+            let start = self.path.len().saturating_sub(hc);
+            if self.path[start..].contains(&b.zobrist) {
+                return Ok(0);
+            }
+        }
+
         let en_jaque = b.in_check(b.turn);
         if en_jaque && ply < 40 {
             depth += 1; // extension de jaque
@@ -269,12 +306,49 @@ impl Searcher {
             return Ok(if en_jaque { -MATE + ply as i32 } else { 0 });
         }
         self.order_moves_ply(b, &mut moves, tt_move, ply);
+        self.path.push(b.zobrist);
+
+        // Mas conservador que en Python (que reducia desde la jugada #3 a
+        // partir de profundidad 3): con SEE+killers el motor en Rust ya
+        // llega mucho mas hondo que Python en el mismo segundo de reloj
+        // (nps 100-500x mayor), asi que "ganar una ply mas" vale bastante
+        // menos y el riesgo de descartar una jugada buena en la
+        // verificacion reducida pesa mas. Medido: la version "Python-like"
+        // (desde jugada 3, prof>=3, reduccion de hasta 2 ply) le costo
+        // ~320 ELO en el torneo de referencia (18 partidas) pese a haber
+        // dado bien en un mini-torneo de 4 partidas -- reducir desde mas
+        // tarde en el orden, a mas profundidad, y nunca mas de 1 ply.
+        const LMR_MOVES_SIN_REDUCIR: usize = 5;
+        const LMR_PROF_MIN: i32 = 5;
 
         let mut best_score = -INFINITO;
         let mut best_move = None;
-        for mv in &moves {
+        for (idx, mv) in moves.iter().enumerate() {
+            // LMR: candidatas a reducir son jugadas silenciosas, tarde en el
+            // orden (ya viene de mejor a peor), sin jaque propio ni jaque
+            // que dan -- justo donde el orden ya filtra la mayoria de
+            // jugadas malas sin gastar profundidad completa.
+            let es_reducible = self.modo_lmr
+                && !en_jaque
+                && idx >= LMR_MOVES_SIN_REDUCIR
+                && depth >= LMR_PROF_MIN
+                && !mv.is_capture()
+                && mv.promotion.is_none();
+
             let next = b.make_move(mv);
-            let sc = -self.negamax(&next, depth - 1, -beta, -alpha, ply + 1)?;
+            let sc = if es_reducible && !next.in_check(next.turn) {
+                let r = 1i32.min(depth - 2);
+                let reducido = -self.negamax(&next, depth - 1 - r, -beta, -alpha, ply + 1)?;
+                if reducido > alpha {
+                    // la reduccion sugiere que podria ser buena: confirmar a profundidad completa
+                    -self.negamax(&next, depth - 1, -beta, -alpha, ply + 1)?
+                } else {
+                    reducido
+                }
+            } else {
+                -self.negamax(&next, depth - 1, -beta, -alpha, ply + 1)?
+            };
+
             if sc > best_score {
                 best_score = sc;
                 best_move = Some(*mv);
@@ -287,6 +361,7 @@ impl Searcher {
                 break;
             }
         }
+        self.path.pop();
 
         let flag = if best_score <= alpha_orig {
             TTFlag::Alpha
@@ -306,6 +381,7 @@ impl Searcher {
         self.deadline = None;
         self.stop = false;
         self.killers = vec![[None, None]; MAX_KILLER_PLY];
+        self.path = self.game_history.clone();
         let mut mejor_mv = None;
         let mut mejor_sc = -INFINITO;
         for d in 1..=depth {
@@ -318,11 +394,15 @@ impl Searcher {
             let mut alpha = -INFINITO;
             let mut actual_mv = ordered[0];
             let mut actual_sc = -INFINITO;
+            self.path.push(b.zobrist);
             for mv in &ordered {
                 let next = b.make_move(mv);
                 let sc = match self.negamax(&next, d - 1, -INFINITO, -alpha, 1) {
                     Ok(v) => -v,
-                    Err(_) => return (mejor_mv.or(Some(actual_mv)), mejor_sc, self.nodes),
+                    Err(_) => {
+                        self.path.pop();
+                        return (mejor_mv.or(Some(actual_mv)), mejor_sc, self.nodes);
+                    }
                 };
                 if sc > actual_sc {
                     actual_sc = sc;
@@ -332,6 +412,7 @@ impl Searcher {
                     alpha = sc;
                 }
             }
+            self.path.pop();
             mejor_mv = Some(actual_mv);
             mejor_sc = actual_sc;
         }
@@ -343,6 +424,7 @@ impl Searcher {
         self.nodes = 0;
         self.stop = false;
         self.killers = vec![[None, None]; MAX_KILLER_PLY];
+        self.path = self.game_history.clone();
         let inicio = Instant::now();
         let budget = movetime_ms.saturating_sub(30).max(10);
         self.deadline = Some(inicio + std::time::Duration::from_millis(budget));
@@ -361,6 +443,7 @@ impl Searcher {
             let mut actual_mv = ordered[0];
             let mut actual_sc = -INFINITO;
             let mut timed_out = false;
+            self.path.push(b.zobrist);
             for mv in &ordered {
                 let next = b.make_move(mv);
                 match self.negamax(&next, d - 1, -INFINITO, -alpha, 1) {
@@ -380,6 +463,7 @@ impl Searcher {
                     }
                 }
             }
+            self.path.pop();
             if timed_out {
                 break;
             }

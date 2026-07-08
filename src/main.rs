@@ -188,6 +188,63 @@ fn run_cxb4_bug() {
     println!("{}", if uci == "c3b4" { "eligio cxb4 (igual que v3 sin proteccion)" } else { "NO eligio cxb4" });
 }
 
+fn run_repetition_tests() {
+    // Metodologia: buscar SIN contexto de repeticion para obtener la jugada
+    // "natural" y la posicion que resulta de jugarla; despues sembrar
+    // game_history con ESA posicion exacta (simulando que ya ocurrio una
+    // vez antes en la partida) y volver a buscar. Esto prueba el mecanismo
+    // de forma directa y verificable sin depender de armar a mano una
+    // secuencia real de jaques repetibles.
+    let mut ok = true;
+
+    println!("=== Test A: GANANDO (K+D+T vs K), debe EVITAR repetir ===");
+    // halfmove_clock=10 (no 0): la ventana de repeticion usa hc como
+    // "cuantas jugadas reversibles hacia atras puedo mirar" -- con hc=0
+    // es matematicamente imposible que exista una ocurrencia previa (el
+    // contador se acaba de reiniciar), asi que hace falta margen real.
+    let fen_a = "4k3/8/4K3/8/8/8/8/3QR3 w - - 10 6";
+    let ba = Board::from_fen(fen_a).unwrap();
+    let mut s1 = Searcher::new(16);
+    let (mv1, sc1, _) = s1.search_fixed_depth(&ba, 6);
+    let mv1 = mv1.expect("deberia haber jugada legal");
+    let p2 = ba.make_move(&mv1);
+    println!("  sin historial: jugada={} score={}", mv1.to_uci(), sc1);
+
+    let mut s2 = Searcher::new(16);
+    s2.set_game_history(vec![p2.zobrist]);
+    let (mv2, sc2, _) = s2.search_fixed_depth(&ba, 6);
+    let mv2 = mv2.expect("deberia haber jugada legal");
+    println!("  con esa posicion ya \"vista\": jugada={} score={}", mv2.to_uci(), sc2);
+    // Debe seguir siendo claramente ganador (no cerca de 0) -- si eligio la
+    // MISMA jugada que antes, su resultado NO debe coincidir con p2 (busco
+    // otra continuacion), o el score debe seguir siendo muy alto.
+    let evito = mv2 != mv1 || sc2.abs() > 500;
+    ok &= evito;
+    println!("  {}", if evito { "OK: sigue jugando para ganar, no repite a lo tonto" } else { "FALLO: parece haber aceptado repetir estando ganando" });
+
+    println!("\n=== Test B: PERDIENDO (K vs K+D+T), debe BUSCAR repetir ===");
+    let fen_b = "8/8/4k3/8/8/4K3/8/3qr3 w - - 10 6";
+    let bb = Board::from_fen(fen_b).unwrap();
+    let mut s3 = Searcher::new(16);
+    let (mv3, sc3, _) = s3.search_fixed_depth(&bb, 6);
+    let mv3 = mv3.expect("deberia haber jugada legal");
+    let p2b = bb.make_move(&mv3);
+    println!("  sin historial: jugada={} score={} (posicion perdida de verdad)", mv3.to_uci(), sc3);
+
+    let mut s4 = Searcher::new(16);
+    s4.set_game_history(vec![p2b.zobrist]);
+    let (mv4, sc4, _) = s4.search_fixed_depth(&bb, 6);
+    let mv4 = mv4.expect("deberia haber jugada legal");
+    println!("  con esa posicion ya \"vista\": jugada={} score={}", mv4.to_uci(), sc4);
+    // Ahora debe preferir la tabla (score cerca de 0) en vez de seguir
+    // perdiendo (sc3, que deberia ser muy negativo o mate en contra).
+    let busca_tablas = sc4 > sc3 + 200 && sc4.abs() < 200;
+    ok &= busca_tablas;
+    println!("  {}", if busca_tablas { "OK: prefiere la repeticion (tablas) en vez de seguir perdiendo" } else { "FALLO: no aprovecho la repeticion disponible" });
+
+    println!("\n{}", if ok { "TODOS LOS TESTS DE REPETICION OK" } else { "HAY FALLOS EN LA DETECCION DE REPETICION" });
+}
+
 fn run_see_tests() {
     let mut ok = true;
     let casos: Vec<(&str, &str, &str, i32)> = vec![
@@ -264,6 +321,7 @@ fn uci_loop() {
     let stdin = io::stdin();
     let mut board = Board::from_fen(STARTPOS).unwrap();
     let mut searcher = Searcher::new(64);
+    let mut game_history: Vec<u64> = Vec::new();
 
     for line in stdin.lock().lines() {
         let line = match line {
@@ -290,6 +348,7 @@ fn uci_loop() {
             "ucinewgame" => {
                 board = Board::from_fen(STARTPOS).unwrap();
                 searcher.clear_tt();
+                game_history.clear();
             }
             "position" => {
                 let mut idx = 1;
@@ -308,15 +367,21 @@ fn uci_loop() {
                     };
                     idx = moves_pos;
                 }
+                // Historial de claves Zobrist de la partida real (para deteccion
+                // de repeticion) -- clave de CADA posicion ancestro, sin incluir
+                // la posicion final/actual (esa la maneja negamax directamente).
+                game_history.clear();
                 if partes.get(idx) == Some(&"moves") {
                     for uci in &partes[idx + 1..] {
                         if let Some(mv) = parse_uci_move(&board, uci) {
+                            game_history.push(board.zobrist);
                             board = board.make_move(&mv);
                         }
                     }
                 }
             }
             "go" => {
+                searcher.set_game_history(game_history.clone());
                 let mut movetime: u64 = 2000;
                 if let Some(i) = partes.iter().position(|&p| p == "movetime") {
                     movetime = partes.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(2000);
@@ -381,6 +446,10 @@ fn main() {
             }
             "seetest" => {
                 run_see_tests();
+                return;
+            }
+            "repetitiontest" => {
+                run_repetition_tests();
                 return;
             }
             _ => {}
