@@ -63,6 +63,24 @@ fn run_divide(fen: &str, depth: u32) {
     println!("total: {}", total);
 }
 
+fn run_smp_bench(movetime_ms: u64) {
+    let fen = "r1bqk2r/ppp2ppp/2n2n2/2bpp3/2B1P3/2NP1N2/PPP2PPP/R1BQK2R w KQkq - 0 6";
+    let b = Board::from_fen(fen).unwrap();
+    println!("Benchmark Lazy SMP -- posicion de medio juego, {}ms por hilo/config", movetime_ms);
+    for n in [1usize, 2, 4, 6, 8] {
+        let (tt, tt_mask) = search::construir_tt(64);
+        let t0 = Instant::now();
+        let (mv, sc, nodos, resultados) = search::buscar_lazy_smp(&b, movetime_ms, 64, n, &tt, tt_mask, false);
+        let dt = t0.elapsed();
+        let nps = nodos as f64 / dt.as_secs_f64().max(0.0001);
+        let profs: Vec<i32> = resultados.iter().map(|r| r.profundidad).collect();
+        println!(
+            "  {} hilo(s): jugada={} score={} | {} nodos TOTALES en {:.2}s = {:.0} nps combinados | profundidades por hilo: {:?}",
+            n, mv.map(|m| m.to_uci()).unwrap_or_default(), sc, nodos, dt.as_secs_f64(), nps, profs
+        );
+    }
+}
+
 fn run_bench(depth: i32) {
     let posiciones = [
         ("inicial", STARTPOS),
@@ -524,6 +542,11 @@ fn main() {
             "lmrdiag" => {
                 let depth: i32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(9);
                 run_lmr_diagnostico(depth);
+                return;
+            }
+            "smpbench" => {
+                let movetime: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(2000);
+                run_smp_bench(movetime);
                 return;
             }
             _ => {}
