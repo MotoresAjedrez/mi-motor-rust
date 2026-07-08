@@ -7,6 +7,7 @@ use crate::board::Board;
 use crate::eval::evaluate;
 use crate::movegen::{generate_legal, generate_pseudo_legal};
 use crate::types::{Move, MoveFlag};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 pub const INFINITO: i32 = 30_000;
@@ -30,7 +31,7 @@ enum TTFlag {
 }
 
 #[derive(Clone, Copy)]
-struct TTEntry {
+pub struct TTEntry {
     key: u64,
     depth: i32,
     score: i32,
@@ -42,8 +43,25 @@ pub struct TimeUp;
 
 const MAX_KILLER_PLY: usize = 100; // margen sobre MAX_PLY para cubrir extensiones de jaque
 
+// TT compartida entre hilos (Lazy SMP): un Mutex POR CASILLERO, no uno solo
+// para toda la tabla -- bloquear la tabla entera en cada sondeo/guardado
+// (que pasa en CADA nodo) seria un cuello de botella tan grande que
+// anularia la ganancia de buscar en paralelo. Con un mutex por casillero,
+// dos hilos solo compiten de verdad si sus busquedas chocan en el MISMO
+// indice de la tabla al mismo tiempo, algo relativamente raro con una
+// tabla de tamano razonable.
+pub type SharedTT = Vec<Mutex<Option<TTEntry>>>;
+
+pub fn construir_tt(tt_mb: usize) -> (Arc<SharedTT>, usize) {
+    let entry_size = std::mem::size_of::<Option<TTEntry>>().max(1);
+    let mut n_entries = (tt_mb * 1024 * 1024 / entry_size).max(1024);
+    n_entries = n_entries.next_power_of_two() >> 1; // asegurar potencia de 2 sin pasarse
+    let tt: SharedTT = (0..n_entries).map(|_| Mutex::new(None)).collect();
+    (Arc::new(tt), n_entries - 1)
+}
+
 pub struct Searcher {
-    tt: Vec<Option<TTEntry>>,
+    tt: Arc<SharedTT>,
     tt_mask: usize,
     pub nodes: u64,
     deadline: Option<Instant>,
@@ -60,6 +78,12 @@ pub struct Searcher {
     // sabe CUANTAS veces se visito esa posicion en esta partida especifica.
     game_history: Vec<u64>,
     path: Vec<u64>,
+    pub lmr_intentos: u64,
+    pub lmr_reintentos: u64,
+    // Lazy SMP: si esta activo, este hilo intercambia las 2 primeras
+    // jugadas del orden en la RAIZ (una vez, al armar el orden inicial) para
+    // no explorar exactamente la misma linea primero que los demas hilos.
+    pub variante_orden_raiz: bool,
 }
 
 fn valor_pieza(pt: crate::types::PieceType) -> i32 {
@@ -75,12 +99,10 @@ fn valor_pieza(pt: crate::types::PieceType) -> i32 {
 
 impl Searcher {
     pub fn new(tt_mb: usize) -> Searcher {
-        let entry_size = std::mem::size_of::<Option<TTEntry>>().max(1);
-        let mut n_entries = (tt_mb * 1024 * 1024 / entry_size).max(1024);
-        n_entries = n_entries.next_power_of_two() >> 1; // asegurar potencia de 2 sin pasarse
+        let (tt, tt_mask) = construir_tt(tt_mb);
         Searcher {
-            tt: vec![None; n_entries],
-            tt_mask: n_entries - 1,
+            tt,
+            tt_mask,
             nodes: 0,
             deadline: None,
             stop: false,
@@ -89,6 +111,31 @@ impl Searcher {
             modo_lmr: std::env::var("MIMOTOR_LMR").as_deref() == Ok("1"),
             game_history: Vec::new(),
             path: Vec::new(),
+            lmr_intentos: 0,
+            lmr_reintentos: 0,
+            variante_orden_raiz: false,
+        }
+    }
+
+    /// Crea un Searcher que comparte la TT (Arc clonado, mismo mask) de otro
+    /// -- para Lazy SMP, donde varios hilos buscan sobre la misma tabla.
+    /// Killers/history/game_history quedan LOCALES de este hilo (no tiene
+    /// sentido compartirlos, cada hilo ordena sus propias jugadas).
+    pub fn new_con_tt_compartida(tt: Arc<SharedTT>, tt_mask: usize, modo_lmr: bool) -> Searcher {
+        Searcher {
+            tt,
+            tt_mask,
+            nodes: 0,
+            deadline: None,
+            stop: false,
+            killers: vec![[None, None]; MAX_KILLER_PLY],
+            history: Box::new([[0i32; 64]; 64]),
+            modo_lmr,
+            game_history: Vec::new(),
+            path: Vec::new(),
+            lmr_intentos: 0,
+            lmr_reintentos: 0,
+            variante_orden_raiz: false,
         }
     }
 
@@ -108,8 +155,8 @@ impl Searcher {
     }
 
     pub fn clear_tt(&mut self) {
-        for e in self.tt.iter_mut() {
-            *e = None;
+        for e in self.tt.iter() {
+            *e.lock().unwrap() = None;
         }
         self.history = Box::new([[0i32; 64]; 64]);
         self.game_history.clear();
@@ -129,7 +176,8 @@ impl Searcher {
     }
 
     fn tt_probe(&self, key: u64) -> Option<TTEntry> {
-        match self.tt[self.tt_index(key)] {
+        let idx = self.tt_index(key);
+        match *self.tt[idx].lock().unwrap() {
             Some(e) if e.key == key => Some(e),
             _ => None,
         }
@@ -137,7 +185,7 @@ impl Searcher {
 
     fn tt_store(&mut self, key: u64, depth: i32, score: i32, flag: TTFlag, best: Option<Move>) {
         let idx = self.tt_index(key);
-        self.tt[idx] = Some(TTEntry { key, depth, score, flag, best });
+        *self.tt[idx].lock().unwrap() = Some(TTEntry { key, depth, score, flag, best });
     }
 
     fn check_time(&mut self) -> Result<(), TimeUp> {
@@ -337,10 +385,12 @@ impl Searcher {
 
             let next = b.make_move(mv);
             let sc = if es_reducible && !next.in_check(next.turn) {
+                self.lmr_intentos += 1;
                 let r = 1i32.min(depth - 2);
                 let reducido = -self.negamax(&next, depth - 1 - r, -beta, -alpha, ply + 1)?;
                 if reducido > alpha {
                     // la reduccion sugiere que podria ser buena: confirmar a profundidad completa
+                    self.lmr_reintentos += 1;
                     -self.negamax(&next, depth - 1, -beta, -alpha, ply + 1)?
                 } else {
                     reducido
@@ -420,7 +470,7 @@ impl Searcher {
     }
 
     /// Busqueda con presupuesto de tiempo (para UCI "go movetime").
-    pub fn search_time(&mut self, b: &Board, movetime_ms: u64, max_depth: i32, mut on_info: impl FnMut(i32, i32, u64, u64)) -> (Option<Move>, i32) {
+    pub fn search_time(&mut self, b: &Board, movetime_ms: u64, max_depth: i32, mut on_info: impl FnMut(i32, i32, u64, u64)) -> (Option<Move>, i32, i32) {
         self.nodes = 0;
         self.stop = false;
         self.killers = vec![[None, None]; MAX_KILLER_PLY];
@@ -431,6 +481,7 @@ impl Searcher {
 
         let mut mejor_mv: Option<Move> = None;
         let mut mejor_sc = 0;
+        let mut mejor_prof = 0;
 
         for d in 1..=max_depth {
             let moves = generate_legal(b);
@@ -439,6 +490,9 @@ impl Searcher {
             }
             let mut ordered = moves.clone();
             self.order_moves_ply(b, &mut ordered, mejor_mv, 0);
+            if self.variante_orden_raiz && ordered.len() >= 2 {
+                ordered.swap(0, 1);
+            }
             let mut alpha = -INFINITO;
             let mut actual_mv = ordered[0];
             let mut actual_sc = -INFINITO;
@@ -469,6 +523,7 @@ impl Searcher {
             }
             mejor_mv = Some(actual_mv);
             mejor_sc = actual_sc;
+            mejor_prof = d;
             on_info(d, mejor_sc, self.nodes, inicio.elapsed().as_millis() as u64);
 
             if mejor_sc.abs() >= MATE - 1000 {
@@ -478,6 +533,75 @@ impl Searcher {
                 break;
             }
         }
-        (mejor_mv, mejor_sc)
+        (mejor_mv, mejor_sc, mejor_prof)
     }
+}
+
+// ============================================================
+//  Lazy SMP: varios hilos nativos buscando la misma posicion raiz en
+//  paralelo, compartiendo la TT (con locks por casillero). Cada hilo tiene
+//  su propio killers/history (no compartidos, no hay beneficio claro y
+//  complica el codigo sin necesidad). El resultado final es el del hilo
+//  que llego mas profundo (o, empatados, el de score mas decisivo).
+// ============================================================
+
+pub struct ResultadoHilo {
+    pub mv: Option<Move>,
+    pub score: i32,
+    pub profundidad: i32,
+    pub nodos: u64,
+}
+
+/// Busca `b` con `n_hilos` hilos nativos compartiendo TT, con el mismo
+/// presupuesto de reloj que una busqueda de un solo hilo (el paralelismo es
+/// para ver MAS nodos en el mismo tiempo, no para tardar mas). Variacion
+/// entre hilos: los hilos de indice impar arrancan con las dos primeras
+/// jugadas del orden intercambiadas, para que no todos exploren exactamente
+/// la misma linea primero -- ademas de la variacion natural que ya aporta
+/// el timing real de acceso a la TT compartida entre hilos genuinamente
+/// concurrentes (el mecanismo clasico detras de Lazy SMP).
+/// `tt` se pasa ya construida (y se espera que el LLAMADOR la guarde y
+/// reutilice entre jugadas de la misma partida, igual que la TT de un
+/// Searcher normal persiste entre llamadas a "go" -- si se reconstruyera
+/// de cero en cada jugada, Lazy SMP perderia la continuidad de la TT entre
+/// plies, una desventaja injusta frente a la version de un solo hilo.
+pub fn buscar_lazy_smp(
+    b: &Board,
+    movetime_ms: u64,
+    max_depth: i32,
+    n_hilos: usize,
+    tt: &Arc<SharedTT>,
+    tt_mask: usize,
+    modo_lmr: bool,
+) -> (Option<Move>, i32, u64, Vec<ResultadoHilo>) {
+    if n_hilos <= 1 {
+        let mut s = Searcher::new_con_tt_compartida(Arc::clone(tt), tt_mask, modo_lmr);
+        let (mv, sc, prof) = s.search_time(b, movetime_ms, max_depth, |_, _, _, _| {});
+        let nodos = s.nodes;
+        return (mv, sc, nodos, vec![ResultadoHilo { mv, score: sc, profundidad: prof, nodos }]);
+    }
+
+    let board_copy = *b;
+
+    let handles: Vec<_> = (0..n_hilos)
+        .map(|i| {
+            let tt = Arc::clone(tt);
+            std::thread::spawn(move || {
+                let mut s = Searcher::new_con_tt_compartida(tt, tt_mask, modo_lmr);
+                s.variante_orden_raiz = i % 2 == 1;
+                let (mv, sc, prof) = s.search_time(&board_copy, movetime_ms, max_depth, |_, _, _, _| {});
+                ResultadoHilo { mv, score: sc, profundidad: prof, nodos: s.nodes }
+            })
+        })
+        .collect();
+
+    let resultados: Vec<ResultadoHilo> = handles.into_iter().map(|h| h.join().expect("hilo de busqueda con panic")).collect();
+
+    let nodos_totales: u64 = resultados.iter().map(|r| r.nodos).sum();
+    let mejor = resultados
+        .iter()
+        .max_by_key(|r| (r.profundidad, r.score.abs()))
+        .expect("al menos un hilo");
+
+    (mejor.mv, mejor.score, nodos_totales, resultados)
 }

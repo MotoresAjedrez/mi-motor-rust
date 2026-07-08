@@ -79,7 +79,60 @@ fn run_bench(depth: i32) {
             "{}: profundidad {} -> {} (score {}) | {} nodos en {:.2}s = {:.0} nps",
             nombre, depth, mv.map(|m| m.to_uci()).unwrap_or_default(), sc, nodes, dt.as_secs_f64(), nps
         );
+        if s.lmr_intentos > 0 {
+            println!(
+                "  LMR: {} intentos, {} re-busquedas a profundidad completa ({:.1}%)",
+                s.lmr_intentos, s.lmr_reintentos, 100.0 * s.lmr_reintentos as f64 / s.lmr_intentos as f64
+            );
+        }
     }
+}
+
+fn run_lmr_diagnostico(depth: i32) {
+    // Compara LMR encendido vs apagado en un lote de posiciones tacticas
+    // conocidas, a PROFUNDIDAD FIJA (no por tiempo, para que la comparacion
+    // sea limpia): si LMR encuentra el mismo score o mejor en todas, es
+    // evidencia fuerte de que el mecanismo en si es correcto (no hay jugadas
+    // tacticas que se esten perdiendo por la reduccion) y la perdida de ELO
+    // medida en torneo es un tema de presupuesto de tiempo/profundidad
+    // efectiva, no un bug de logica.
+    let posiciones = [
+        ("inicial", STARTPOS),
+        ("medio juego", "r1bqk2r/ppp2ppp/2n2n2/2bpp3/2B1P3/2NP1N2/PPP2PPP/R1BQK2R w KQkq - 0 6"),
+        ("tactica capturas", "r2q1rk1/pp1nbppp/2p1pn2/3p4/2PP4/1PN1PN2/PB3PPP/R2Q1RK1 w - - 0 10"),
+        ("bug cxb4", "r1b1k2r/ppqp1ppp/4p3/4n3/1b6/2PQBN2/P1P2PPP/R3KB1R w KQkq - 0 11"),
+        ("mate pastor", "r1bqkb1r/pppp1ppp/2n2n2/4p2Q/2B1P3/8/PPPP1PPP/RNB1K1NR w KQkq - 4 4"),
+        ("final torres", "8/5pk1/6p1/8/8/1R6/5PPP/6K1 w - - 0 1"),
+        ("kiwipete-ish", "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1"),
+    ];
+    let mut peor_encontrado = false;
+    for (nombre, fen) in posiciones {
+        let b = Board::from_fen(fen).unwrap();
+        let mut s_sin = Searcher::new(32);
+        s_sin.modo_lmr = false;
+        let (mv_sin, sc_sin, _) = s_sin.search_fixed_depth(&b, depth);
+
+        let mut s_con = Searcher::new(32);
+        s_con.modo_lmr = true;
+        let (mv_con, sc_con, _) = s_con.search_fixed_depth(&b, depth);
+
+        let diff = sc_con - sc_sin;
+        let peor = diff < -20; // margen chico de ruido por desempates de orden
+        peor_encontrado |= peor;
+        println!(
+            "{:20} sin-LMR: {} (score {})   con-LMR: {} (score {})   diff={:+}  {}",
+            nombre,
+            mv_sin.map(|m| m.to_uci()).unwrap_or_default(), sc_sin,
+            mv_con.map(|m| m.to_uci()).unwrap_or_default(), sc_con,
+            diff,
+            if peor { "*** LMR PEOR ***" } else if mv_sin == mv_con { "(misma jugada)" } else { "(distinta jugada, score similar)" }
+        );
+    }
+    println!("\n{}", if peor_encontrado {
+        "LMR encontro una jugada claramente peor en al menos una posicion -- revisar mas"
+    } else {
+        "LMR no perdio ninguna tactica en este lote a profundidad fija -- consistente con tradeoff de tiempo, no bug de logica"
+    });
 }
 
 fn run_mate_tests() {
@@ -322,6 +375,11 @@ fn uci_loop() {
     let mut board = Board::from_fen(STARTPOS).unwrap();
     let mut searcher = Searcher::new(64);
     let mut game_history: Vec<u64> = Vec::new();
+    let n_hilos: usize = std::env::var("MIMOTOR_HILOS").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
+    // TT compartida persistente para Lazy SMP -- se construye una sola vez y
+    // se reutiliza entre jugadas de la partida (igual que la TT normal de
+    // un Searcher), no se reconstruye en cada "go".
+    let (smp_tt, smp_tt_mask) = search::construir_tt(64);
 
     for line in stdin.lock().lines() {
         let line = match line {
@@ -349,6 +407,9 @@ fn uci_loop() {
                 board = Board::from_fen(STARTPOS).unwrap();
                 searcher.clear_tt();
                 game_history.clear();
+                for e in smp_tt.iter() {
+                    *e.lock().unwrap() = None;
+                }
             }
             "position" => {
                 let mut idx = 1;
@@ -399,11 +460,19 @@ fn uci_loop() {
                     let mio = if board.turn == types::Color::White { wtime } else { btime };
                     movetime = ((mio / 30).max(50)) as u64;
                 }
-                let (mv, sc) = searcher.search_time(&board, movetime, 64, |depth, score, nodes, ms| {
-                    println!("info depth {} score cp {} nodes {} time {}", depth, score, nodes, ms);
+                let mv = if n_hilos > 1 {
+                    let (mv, sc, nodos, _) = search::buscar_lazy_smp(&board, movetime, 64, n_hilos, &smp_tt, smp_tt_mask, searcher.modo_lmr);
+                    println!("info score cp {} nodes {}", sc, nodos);
                     io::stdout().flush().ok();
-                });
-                let _ = sc;
+                    mv
+                } else {
+                    let (mv, sc, _) = searcher.search_time(&board, movetime, 64, |depth, score, nodes, ms| {
+                        println!("info depth {} score cp {} nodes {} time {}", depth, score, nodes, ms);
+                        io::stdout().flush().ok();
+                    });
+                    let _ = sc;
+                    mv
+                };
                 println!("bestmove {}", mv.map(|m| m.to_uci()).unwrap_or_else(|| "0000".to_string()));
                 io::stdout().flush().ok();
             }
@@ -450,6 +519,11 @@ fn main() {
             }
             "repetitiontest" => {
                 run_repetition_tests();
+                return;
+            }
+            "lmrdiag" => {
+                let depth: i32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(9);
+                run_lmr_diagnostico(depth);
                 return;
             }
             _ => {}
