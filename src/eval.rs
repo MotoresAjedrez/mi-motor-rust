@@ -489,10 +489,8 @@ pub fn evaluate(b: &Board) -> i32 {
 
     // Bloque especifico de personalidad: Tal mantiene piezas de ataque
     // cuando hay iniciativa (identidad agresiva/sacrificial); Universal en
-    // cambio busca pareja de alfiles, restringe al rival con puestos
-    // avanzados seguros (profilaxis) y prefiere SIMPLIFICAR hacia un final
-    // ganado en vez de retener piezas de ataque -- tecnica de conversion
-    // clasica, coherente con el bloque de finales de arriba.
+    // cambio busca pareja de alfiles y restringe al rival con puestos
+    // avanzados seguros (profilaxis).
     let mut extra = 0.0f64;
     if !es_universal {
         if ar.ataque_w - ar.ataque_b > 60.0 {
@@ -520,24 +518,25 @@ pub fn evaluate(b: &Board) -> i32 {
                 }
             }
         }
+    }
 
-        // Simplificar hacia un final ganado: cuando ya se esta claramente
-        // mejor, cada pieza mayor/menor menos en el tablero (de cualquier
-        // bando) es progreso hacia la conversion -- lo opuesto de "retener
-        // piezas de ataque". Solo pesa si la ventaja ya es significativa
-        // (no en posiciones parejas, donde cambiar piezas no tiene un signo
-        // claro) y crece hacia el final (mgf bajo).
-        let piezas_no_peon = crate::types::ALL_PIECE_TYPES
-            .iter()
-            .filter(|&&pt| pt != PieceType::Pawn && pt != PieceType::King)
-            .map(|&pt| popcount(b.pieces[0][pt as usize] | b.pieces[1][pt as usize]))
-            .sum::<u32>() as f64;
-        const UMBRAL_SIMPLIFICACION: f64 = 150.0;
-        if dif_material > UMBRAL_SIMPLIFICACION {
-            extra += (10.0 - piezas_no_peon) * 2.0 * (0.4 + 0.6 * egf);
-        } else if dif_material < -UMBRAL_SIMPLIFICACION {
-            extra -= (10.0 - piezas_no_peon) * 2.0 * (0.4 + 0.6 * egf);
-        }
+    // Simplificar hacia un final ganado -- o EVITAR simplificar estando peor
+    // -- aplica a las DOS personalidades por igual, no es un gusto de estilo
+    // sino un principio basico: cambiar piezas (sobre todo damas) estando
+    // material abajo apaga las complicaciones/chances de swindle y hace
+    // trivial la tecnica de conversion del rival. Antes vivia solo en el
+    // bloque de Universal; se generaliza aca porque es correcto para
+    // cualquier personalidad, no una cuestion de estilo.
+    let piezas_no_peon = crate::types::ALL_PIECE_TYPES
+        .iter()
+        .filter(|&&pt| pt != PieceType::Pawn && pt != PieceType::King)
+        .map(|&pt| popcount(b.pieces[0][pt as usize] | b.pieces[1][pt as usize]))
+        .sum::<u32>() as f64;
+    const UMBRAL_SIMPLIFICACION: f64 = 150.0;
+    if dif_material > UMBRAL_SIMPLIFICACION {
+        extra += (10.0 - piezas_no_peon) * 2.0 * (0.4 + 0.6 * egf);
+    } else if dif_material < -UMBRAL_SIMPLIFICACION {
+        extra -= (10.0 - piezas_no_peon) * 2.0 * (0.4 + 0.6 * egf);
     }
 
     let total = (mat[1] - mat[0]) as f64 * escala_material
