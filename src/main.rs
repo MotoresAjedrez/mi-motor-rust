@@ -678,13 +678,24 @@ fn uci_loop() {
                         // Reparto clasico: tiempo restante / jugadas que quedan
                         // hasta el proximo control, mas la mayor parte del
                         // incremento (dejando margen para no pasarse de largo).
-                        // Techo de 60s: con relojes de correspondencia (dias
-                        // de tiempo base) esta formula podria salir en horas --
-                        // sin un plan especifico para partidas tan largas, es
-                        // mas seguro limitar el pensamiento por jugada que
-                        // arriesgarse a quedar calculando indefinidamente.
+                        // Techo ADAPTATIVO (no uno solo fijo): el techo bajo
+                        // (3.5s) que hubo antes se puso para relojes de
+                        // CORRESPONDENCIA (base de dias, llega como wtime en
+                        // ms -- sin tope, la formula salia en horas reales,
+                        // medido en partidas reales). Pero aplicado siempre
+                        // tambien capaba blitz/rapid/clasica -- en el
+                        // config.yml del bot, max_base de partidas normales
+                        // es 1800s (30 min), asi que cualquier wtime bien por
+                        // encima de eso (>40 min) es casi con certeza
+                        // correspondencia, no una partida real de tiempo
+                        // rapido/clasico -- ahi si aplica el techo estricto.
+                        // Con tiempo real (rapid/clasica largas), un techo de
+                        // 20s deja pensar mucho mas sin arriesgar el reloj
+                        // (20s todavia es una fraccion chica de 10-30 min).
+                        const UMBRAL_CORRESPONDENCIA_MS: i64 = 40 * 60 * 1000;
+                        let techo: u64 = if mio > UMBRAL_CORRESPONDENCIA_MS { 3_500 } else { 20_000 };
                         let base = mio / movestogo.max(1);
-                        movetime = Some(((base + inc * 8 / 10).max(50) as u64).min(3_500));
+                        movetime = Some(((base + inc * 8 / 10).max(50) as u64).min(techo));
                     } else {
                         movetime = Some(2000); // "go" sin ningun parametro de tiempo: default razonable
                     }
