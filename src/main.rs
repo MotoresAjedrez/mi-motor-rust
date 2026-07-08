@@ -160,6 +160,59 @@ fn run_lmr_diagnostico(depth: i32) {
     });
 }
 
+fn run_singular_diagnostico(depth: i32) {
+    // Mismo protocolo que run_lmr_diagnostico (comparacion a profundidad FIJA,
+    // no por tiempo): si singular extensions es correcto, el score CON
+    // extensiones nunca deberia ser peor que SIN ellas en este lote -- una
+    // jugada "singular" que en realidad no lo era, o un bug de contabilidad
+    // de profundidad/ventana, se notaria como una caida de score o (mas
+    // grave) una explosion de nodos sin límite claro. Verde en TODO este
+    // lote es la condicion pedida antes de considerar activar el default.
+    let posiciones = [
+        ("inicial", STARTPOS),
+        ("medio juego", "r1bqk2r/ppp2ppp/2n2n2/2bpp3/2B1P3/2NP1N2/PPP2PPP/R1BQK2R w KQkq - 0 6"),
+        ("tactica capturas", "r2q1rk1/pp1nbppp/2p1pn2/3p4/2PP4/1PN1PN2/PB3PPP/R2Q1RK1 w - - 0 10"),
+        ("bug cxb4", "r1b1k2r/ppqp1ppp/4p3/4n3/1b6/2PQBN2/P1P2PPP/R3KB1R w KQkq - 0 11"),
+        ("mate pastor", "r1bqkb1r/pppp1ppp/2n2n2/4p2Q/2B1P3/8/PPPP1PPP/RNB1K1NR w KQkq - 4 4"),
+        ("final torres", "8/5pk1/6p1/8/8/1R6/5PPP/6K1 w - - 0 1"),
+        ("kiwipete-ish", "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1"),
+        ("cacería de rey (partida real v11, jug.31)", "2r3k1/p1bQ1ppp/6b1/6N1/8/5P2/P4P1P/6K1 b - - 1 31"),
+    ];
+    let mut peor_encontrado = false;
+    let mut nodos_explotaron = false;
+    for (nombre, fen) in posiciones {
+        let b = Board::from_fen(fen).unwrap();
+        let mut s_sin = Searcher::new(32);
+        s_sin.modo_singular = false;
+        let (mv_sin, sc_sin, nodos_sin) = s_sin.search_fixed_depth(&b, depth);
+
+        let mut s_con = Searcher::new(32);
+        s_con.modo_singular = true;
+        let (mv_con, sc_con, nodos_con) = s_con.search_fixed_depth(&b, depth);
+
+        let diff = sc_con - sc_sin;
+        let peor = diff < -20; // margen chico de ruido por desempates de orden
+        let ratio_nodos = nodos_con as f64 / nodos_sin.max(1) as f64;
+        let exploto = ratio_nodos > 4.0; // sondeos de SE suman busqueda extra, pero no deberian multiplicar por mucho mas que eso
+        peor_encontrado |= peor;
+        nodos_explotaron |= exploto;
+        println!(
+            "{:30} sin-SE: {} (score {}, {} nodos)   con-SE: {} (score {}, {} nodos, x{:.1})   diff={:+}  {}{}",
+            nombre,
+            mv_sin.map(|m| m.to_uci()).unwrap_or_default(), sc_sin, nodos_sin,
+            mv_con.map(|m| m.to_uci()).unwrap_or_default(), sc_con, nodos_con, ratio_nodos,
+            diff,
+            if peor { "*** SE PEOR ***" } else if mv_sin == mv_con { "(misma jugada)" } else { "(distinta jugada, score similar)" },
+            if exploto { "  *** EXPLOSION DE NODOS ***" } else { "" }
+        );
+    }
+    println!("\n{}", if peor_encontrado || nodos_explotaron {
+        "singular extensions FALLO el diagnostico -- NO activar por defecto (MIMOTOR_SINGULAR=1 sigue disponible solo para pruebas)"
+    } else {
+        "singular extensions paso el diagnostico: sin perdidas de score ni explosion de nodos en este lote"
+    });
+}
+
 fn run_mate_tests() {
     let casos = [
         ("Mate en 1: Ta8# (pasillo)", "6k1/8/6K1/8/8/8/8/R7 w - - 0 1", "a1a8"),
@@ -723,6 +776,11 @@ fn main() {
             "lmrdiag" => {
                 let depth: i32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(9);
                 run_lmr_diagnostico(depth);
+                return;
+            }
+            "singulartest" => {
+                let depth: i32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(9);
+                run_singular_diagnostico(depth);
                 return;
             }
             "smpbench" => {

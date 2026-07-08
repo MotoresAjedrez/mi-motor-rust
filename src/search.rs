@@ -67,6 +67,14 @@ pub struct TimeUp;
 
 const MAX_KILLER_PLY: usize = 100; // margen sobre MAX_PLY para cubrir extensiones de jaque
 
+// 6 tipos de pieza x 64 casilleros, dos veces (jugada rival + jugada propia).
+const CONT_HIST_SIZE: usize = 6 * 64 * 6 * 64;
+
+#[inline]
+fn cont_idx(prev_pt: usize, prev_to: usize, pt: usize, to: usize) -> usize {
+    ((prev_pt * 64 + prev_to) * 6 + pt) * 64 + to
+}
+
 // TT compartida entre hilos (Lazy SMP): un Mutex POR CASILLERO, no uno solo
 // para toda la tabla -- bloquear la tabla entera en cada sondeo/guardado
 // (que pasa en CADA nodo) seria un cuello de botella tan grande que
@@ -94,11 +102,26 @@ pub struct Searcher {
     // actual); history SI persiste entre jugadas de la partida, igual que la TT.
     killers: Vec<[Option<Move>; 2]>,
     history: Box<[[i32; 64]; 64]>, // [from][to] -- arreglo plano, mas rapido que un HashMap aqui
+    // Continuation history ("counter-move history"): a diferencia de history
+    // (que solo sabe "esta jugada [from][to] corto mucho, en general"), esta
+    // tabla sabe "esta jugada [pieza][to] corto mucho DESPUES de que el
+    // rival jugara [pieza][to]" -- captura respuestas tacticas especificas a
+    // una jugada rival concreta (p.ej. recapturas, bloqueos de jaque) que el
+    // history plano no distingue del resto. Indexada
+    // [pieza_rival][casillero_rival][pieza_propia][casillero_propio],
+    // aplanada en un Vec para evitar arrays anidados de tamano fijo.
+    cont_history: Vec<i32>,
     pub modo_lmr: bool,
     // Desactivable solo para comparacion A/B en pruebas (MIMOTOR_NO_ASPIRATION=1)
     // -- en juego real siempre queda activado, la tecnica en si es segura por
     // construccion (ensancha hasta ventana completa si hace falta).
     pub modo_aspiration: bool,
+    // Singular extensions: APAGADO por defecto (al reves que LMR/aspiration).
+    // Solo se activa con MIMOTOR_SINGULAR=1 -- exige el test dedicado
+    // (comando CLI "singulartest") verde antes de proponer cambiar el
+    // default, por pedido explicito: es de las tecnicas mas propensas a
+    // bugs sutiles y no se activa "por si acaso".
+    pub modo_singular: bool,
     // Historial de repeticion: claves Zobrist de la PARTIDA REAL (persiste
     // entre llamadas a go, la maneja el loop UCI) + las de la linea actual
     // de busqueda (crece/decrece durante la recursion, como el "self.hist"
@@ -142,12 +165,14 @@ impl Searcher {
             stop: false,
             killers: vec![[None, None]; MAX_KILLER_PLY],
             history: Box::new([[0i32; 64]; 64]),
+            cont_history: vec![0i32; CONT_HIST_SIZE],
             // Activado por defecto: el torneo h2h de esta sesion confirmo
             // +80 ELO (61.3% en 40 partidas) con la reescritura PVS -- ver
             // resultados_lmr_h2h.txt en ~/mi-motor. MIMOTOR_LMR=0 lo desactiva
             // explicitamente para pruebas comparativas.
             modo_lmr: std::env::var("MIMOTOR_LMR").as_deref() != Ok("0"),
             modo_aspiration: std::env::var("MIMOTOR_NO_ASPIRATION").as_deref() != Ok("1"),
+            modo_singular: std::env::var("MIMOTOR_SINGULAR").as_deref() == Ok("1"),
             game_history: Vec::new(),
             path: Vec::new(),
             lmr_intentos: 0,
@@ -170,8 +195,10 @@ impl Searcher {
             stop: false,
             killers: vec![[None, None]; MAX_KILLER_PLY],
             history: Box::new([[0i32; 64]; 64]),
+            cont_history: vec![0i32; CONT_HIST_SIZE],
             modo_lmr,
             modo_aspiration: std::env::var("MIMOTOR_NO_ASPIRATION").as_deref() != Ok("1"),
+            modo_singular: std::env::var("MIMOTOR_SINGULAR").as_deref() == Ok("1"),
             game_history: Vec::new(),
             path: Vec::new(),
             lmr_intentos: 0,
@@ -187,7 +214,7 @@ impl Searcher {
         self.external_stop = flag;
     }
 
-    fn registrar_corte(&mut self, mv: Move, ply: u32, depth: i32) {
+    fn registrar_corte(&mut self, mv: Move, ply: u32, depth: i32, prev: Option<(usize, usize)>, pt_mv: usize) {
         if mv.is_capture() {
             return; // MVV-LVA/SEE ya ordenan las capturas primero, no necesitan refuerzo
         }
@@ -200,6 +227,10 @@ impl Searcher {
             }
         }
         self.history[mv.from as usize][mv.to as usize] += depth * depth;
+        if let Some((prev_pt, prev_to)) = prev {
+            let idx = cont_idx(prev_pt, prev_to, pt_mv, mv.to as usize);
+            self.cont_history[idx] += depth * depth;
+        }
     }
 
     /// Fija el historial de claves Zobrist de la PARTIDA REAL hasta la
@@ -252,12 +283,15 @@ impl Searcher {
     }
 
     fn order_moves(&self, b: &Board, moves: &mut Vec<Move>, tt_move: Option<Move>) {
-        self.order_moves_ply(b, moves, tt_move, MAX_KILLER_PLY as u32);
+        self.order_moves_ply(b, moves, tt_move, MAX_KILLER_PLY as u32, None);
     }
 
     /// Igual que order_moves pero ademas usa killers/history (por ply) para
     /// ordenar las jugadas silenciosas -- capturas/TT siguen mandando.
-    fn order_moves_ply(&self, b: &Board, moves: &mut Vec<Move>, tt_move: Option<Move>, ply: u32) {
+    /// `prev` es (pieza, casillero_destino) de la jugada rival que llevo a
+    /// esta posicion (None si no se conoce, p.ej. en la raiz) -- alimenta la
+    /// continuation history para las jugadas silenciosas.
+    fn order_moves_ply(&self, b: &Board, moves: &mut Vec<Move>, tt_move: Option<Move>, ply: u32, prev: Option<(usize, usize)>) {
         let p = ply as usize;
         let killers = if p < MAX_KILLER_PLY { Some(self.killers[p]) } else { None };
         moves.sort_by_key(|mv| {
@@ -273,7 +307,15 @@ impl Searcher {
             } else if killers.is_some_and(|k| k[1] == Some(*mv)) {
                 -2900
             } else {
-                -self.history[mv.from as usize][mv.to as usize]
+                let h = self.history[mv.from as usize][mv.to as usize];
+                let ch = match prev {
+                    Some((prev_pt, prev_to)) => {
+                        let pt_mv = b.piece_at(mv.from).map(|(_, pt)| pt as usize).unwrap_or(0);
+                        self.cont_history[cont_idx(prev_pt, prev_to, pt_mv, mv.to as usize)]
+                    }
+                    None => 0,
+                };
+                -(h + ch)
             }
         });
     }
@@ -332,7 +374,16 @@ impl Searcher {
         Ok(best)
     }
 
-    fn negamax(&mut self, b: &Board, mut depth: i32, mut alpha: i32, beta: i32, ply: u32) -> Result<i32, TimeUp> {
+    // `en_sondeo_se`: true si este nodo ya es descendiente de una busqueda
+    // de VERIFICACION de singular extensions. Critico: sin este freno, cada
+    // nodo dentro de esa verificacion podria a su vez lanzar su PROPIA
+    // verificacion (y esos, la suya), multiplicando el trabajo en cadena en
+    // vez de sumarlo -- confirmado en la practica (una posicion tardo mas de
+    // 9 minutos en profundidad fija 9 antes de este freno). Una vez que un
+    // nodo entra en modo verificacion, TODOS sus descendientes lo heredan
+    // (se propaga, no se resetea a cada paso) y ninguno intenta su propia
+    // singular extension.
+    fn negamax(&mut self, b: &Board, mut depth: i32, mut alpha: i32, beta: i32, ply: u32, prev: Option<(usize, usize)>, en_sondeo_se: bool) -> Result<i32, TimeUp> {
         self.check_time()?;
 
         if b.halfmove_clock >= 100 {
@@ -380,8 +431,10 @@ impl Searcher {
         let alpha_orig = alpha;
         let key = b.zobrist;
         let mut tt_move = None;
+        let mut tt_entry_full: Option<TTEntry> = None;
         if let Some(entry) = self.tt_probe(key) {
             tt_move = entry.best;
+            tt_entry_full = Some(entry);
             if entry.depth >= depth {
                 match entry.flag {
                     TTFlag::Exact => return Ok(entry.score),
@@ -405,7 +458,7 @@ impl Searcher {
             && !solo_peones_y_rey(b, b.turn)
         {
             let next = b.make_null_move();
-            let sc_null = -self.negamax(&next, depth - 1 - NULL_MOVE_R, -beta, -beta + 1, ply + 1)?;
+            let sc_null = -self.negamax(&next, depth - 1 - NULL_MOVE_R, -beta, -beta + 1, ply + 1, None, en_sondeo_se)?;
             if sc_null >= beta {
                 return Ok(beta);
             }
@@ -415,8 +468,67 @@ impl Searcher {
         if moves.is_empty() {
             return Ok(if en_jaque { -MATE + ply as i32 } else { 0 });
         }
-        self.order_moves_ply(b, &mut moves, tt_move, ply);
+        self.order_moves_ply(b, &mut moves, tt_move, ply, prev);
         self.path.push(b.zobrist);
+
+        // Singular extensions: si la jugada de la TT es tan claramente
+        // superior a TODAS las demas que ninguna otra logra siquiera
+        // acercarse a su puntaje (verificado con una busqueda reducida,
+        // ventana nula, sobre el RESTO de las jugadas), esa jugada es
+        // "singular" -- la unica opcion real en la posicion -- y merece 1
+        // ply extra de profundidad real en vez de recortarse igual que
+        // cualquier otra. Apagado por defecto (modo_singular), ver comentario
+        // en la definicion del campo.
+        // SE_PROF_MIN=8 (no 6): medido en la practica que con 6 el costo por
+        // nodo elegible se multiplica a lo largo de TODO el arbol (no solo
+        // en la raiz) y en posiciones con mucho material/jaques dispara el
+        // tiempo por un factor >>2x incluso con el freno anti-anidamiento
+        // (en_sondeo_se) ya puesto -- una posicion tardo 5+ minutos en
+        // profundidad fija 9. Con 8, la sonda solo dispara cerca de la raiz
+        // (la profundidad baja rapido bajando por el arbol), acotando el
+        // costo total sin perder el caso de uso principal (decisiones
+        // criticas tempranas en la busqueda).
+        const SE_PROF_MIN: i32 = 8;
+        let mut jugada_singular: Option<Move> = None;
+        if self.modo_singular && !en_sondeo_se && ply > 0 && depth >= SE_PROF_MIN {
+            if let (Some(entry), Some(tmv)) = (tt_entry_full, tt_move) {
+                if entry.depth >= depth - 3
+                    && matches!(entry.flag, TTFlag::Beta | TTFlag::Exact)
+                    && entry.score.abs() < MATE - 1000
+                    && moves.contains(&tmv)
+                {
+                    let margen = 2 * depth;
+                    let sbeta = entry.score - margen;
+                    let sdepth = (depth - 1) / 2;
+                    let mut mejor_otra = -INFINITO;
+                    let mut se_timed_out = false;
+                    for mv in &moves {
+                        if *mv == tmv {
+                            continue;
+                        }
+                        let next = b.make_move(mv);
+                        match self.negamax(&next, sdepth, -sbeta, -sbeta + 1, ply + 1, None, true) {
+                            Ok(v) => {
+                                let sc = -v;
+                                if sc > mejor_otra {
+                                    mejor_otra = sc;
+                                }
+                                if mejor_otra >= sbeta {
+                                    break; // otra jugada ya alcanza la ventana: no es singular
+                                }
+                            }
+                            Err(_) => {
+                                se_timed_out = true;
+                                break;
+                            }
+                        }
+                    }
+                    if !se_timed_out && mejor_otra < sbeta {
+                        jugada_singular = Some(tmv);
+                    }
+                }
+            }
+        }
 
         // Mas conservador que en Python (que reducia desde la jugada #3 a
         // partir de profundidad 3): con SEE+killers el motor en Rust ya
@@ -445,7 +557,10 @@ impl Searcher {
                 && !mv.is_capture()
                 && mv.promotion.is_none();
 
+            let pt_mv = b.piece_at(mv.from).map(|(_, pt)| pt as usize).unwrap_or(0);
             let next = b.make_move(mv);
+            let child_prev = Some((pt_mv, mv.to as usize));
+            let ext = if jugada_singular == Some(*mv) { 1 } else { 0 };
             let sc = if es_reducible && !next.in_check(next.turn) {
                 self.lmr_intentos += 1;
                 let r = 1i32.min(depth - 2);
@@ -454,15 +569,15 @@ impl Searcher {
                 // cuanto mejor. Es un bound, no un valor exacto: si supera
                 // alfa, no se confia en el numero, se re-busca a profundidad
                 // Y ventana completas para obtener el valor real.
-                let sondeo = -self.negamax(&next, depth - 1 - r, -alpha - 1, -alpha, ply + 1)?;
+                let sondeo = -self.negamax(&next, depth - 1 + ext - r, -alpha - 1, -alpha, ply + 1, child_prev, en_sondeo_se)?;
                 if sondeo > alpha {
                     self.lmr_reintentos += 1;
-                    -self.negamax(&next, depth - 1, -beta, -alpha, ply + 1)?
+                    -self.negamax(&next, depth - 1 + ext, -beta, -alpha, ply + 1, child_prev, en_sondeo_se)?
                 } else {
                     sondeo
                 }
             } else {
-                -self.negamax(&next, depth - 1, -beta, -alpha, ply + 1)?
+                -self.negamax(&next, depth - 1 + ext, -beta, -alpha, ply + 1, child_prev, en_sondeo_se)?
             };
 
             if sc > best_score {
@@ -473,7 +588,7 @@ impl Searcher {
                 alpha = sc;
             }
             if alpha >= beta {
-                self.registrar_corte(*mv, ply, depth);
+                self.registrar_corte(*mv, ply, depth, prev, pt_mv);
                 break;
             }
         }
@@ -506,7 +621,7 @@ impl Searcher {
                 break;
             }
             let mut ordered = moves.clone();
-            self.order_moves_ply(b, &mut ordered, mejor_mv, 0);
+            self.order_moves_ply(b, &mut ordered, mejor_mv, 0, None);
 
             const VENTANA_INICIAL: i32 = 50;
             let (mut vent_alpha, mut vent_beta) =
@@ -525,8 +640,9 @@ impl Searcher {
                 self.path.push(b.zobrist);
                 let mut interrumpido = false;
                 for mv in &ordered {
+                    let pt_mv = b.piece_at(mv.from).map(|(_, pt)| pt as usize).unwrap_or(0);
                     let next = b.make_move(mv);
-                    let sc = match self.negamax(&next, d - 1, -vent_beta, -alpha, 1) {
+                    let sc = match self.negamax(&next, d - 1, -vent_beta, -alpha, 1, Some((pt_mv, mv.to as usize)), false) {
                         Ok(v) => -v,
                         Err(_) => {
                             interrumpido = true;
@@ -611,7 +727,7 @@ impl Searcher {
                 break;
             }
             let mut ordered = moves.clone();
-            self.order_moves_ply(b, &mut ordered, mejor_mv, 0);
+            self.order_moves_ply(b, &mut ordered, mejor_mv, 0, None);
             if self.variante_orden_raiz && ordered.len() >= 2 {
                 ordered.swap(0, 1);
             }
@@ -641,8 +757,9 @@ impl Searcher {
                 actual_sc = -INFINITO;
                 self.path.push(b.zobrist);
                 for mv in &ordered {
+                    let pt_mv = b.piece_at(mv.from).map(|(_, pt)| pt as usize).unwrap_or(0);
                     let next = b.make_move(mv);
-                    match self.negamax(&next, d - 1, -vent_beta, -alpha, 1) {
+                    match self.negamax(&next, d - 1, -vent_beta, -alpha, 1, Some((pt_mv, mv.to as usize)), false) {
                         Ok(v) => {
                             let sc = -v;
                             if sc > actual_sc {
