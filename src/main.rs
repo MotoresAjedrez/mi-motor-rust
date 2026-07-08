@@ -3,6 +3,8 @@ mod board;
 mod eval;
 mod movegen;
 mod perft;
+mod polyglot;
+mod polyglot_random;
 mod search;
 mod see;
 mod syzygy;
@@ -312,9 +314,12 @@ fn run_repetition_tests() {
     let (mv4, sc4, _) = s4.search_fixed_depth(&bb, 6);
     let mv4 = mv4.expect("deberia haber jugada legal");
     println!("  con esa posicion ya \"vista\": jugada={} score={}", mv4.to_uci(), sc4);
-    // Ahora debe preferir la tabla (score cerca de 0) en vez de seguir
-    // perdiendo (sc3, que deberia ser muy negativo o mate en contra).
-    let busca_tablas = sc4 > sc3 + 200 && sc4.abs() < 200;
+    // Ahora debe preferir la tabla en vez de seguir perdiendo (sc3, que
+    // deberia ser muy negativo o mate en contra). El "contempt" dinamico
+    // (agregado en esta misma sesion) puntua la repeticion a +/-200 cuando
+    // el eval esta claramente decidido, no exactamente 0 -- por eso el
+    // margen es <= 200 (no < 200): el valor esperado de verdad es 200.
+    let busca_tablas = sc4 > sc3 + 200 && sc4.abs() <= 200;
     ok &= busca_tablas;
     println!("  {}", if busca_tablas { "OK: prefiere la repeticion (tablas) en vez de seguir perdiendo" } else { "FALLO: no aprovecho la repeticion disponible" });
 
@@ -443,6 +448,14 @@ fn uci_loop() {
             Err(e) => eprintln!("info string error cargando tablas Syzygy: {}", e),
         }
     }
+    if let Ok(path) = std::env::var("MIMOTOR_BOOK_PATH") {
+        match polyglot::init(&path) {
+            Ok(n) => eprintln!("info string libro de aperturas cargado ({} entradas)", n),
+            Err(e) => eprintln!("info string error cargando libro de aperturas: {}", e),
+        }
+    }
+    let usar_libro_inicial: bool = std::env::var("MIMOTOR_SIN_LIBRO").as_deref() != Ok("1");
+    polyglot::set_activo(usar_libro_inicial);
     // TT compartida persistente para Lazy SMP -- se construye una sola vez y
     // se reutiliza entre jugadas de la partida (igual que la TT normal de
     // un Searcher), no se reconstruye en cada "go".
@@ -482,6 +495,8 @@ fn uci_loop() {
                 println!("option name Threads type spin default {} min 1 max 16", n_hilos);
                 println!("option name Personalidad type combo default tal var tal var universal");
                 println!("option name SyzygyPath type string default <empty>");
+                println!("option name BookPath type string default <empty>");
+                println!("option name OwnBook type check default true");
                 println!("uciok");
                 io::stdout().flush().ok();
             }
@@ -516,6 +531,17 @@ fn uci_loop() {
                                 Ok(max) => println!("info string tablas Syzygy cargadas ({} piezas max)", max),
                                 Err(e) => println!("info string error cargando tablas Syzygy: {}", e),
                             }
+                        }
+                    } else if nombre.eq_ignore_ascii_case("bookpath") {
+                        if let Some(path) = valor {
+                            match polyglot::init(path) {
+                                Ok(n) => println!("info string libro de aperturas cargado ({} entradas)", n),
+                                Err(e) => println!("info string error cargando libro de aperturas: {}", e),
+                            }
+                        }
+                    } else if nombre.eq_ignore_ascii_case("ownbook") {
+                        if let Some(v) = valor {
+                            polyglot::set_activo(v.eq_ignore_ascii_case("true"));
                         }
                     }
                 }

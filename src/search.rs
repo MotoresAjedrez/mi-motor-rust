@@ -576,6 +576,14 @@ impl Searcher {
         self.killers = vec![[None, None]; MAX_KILLER_PLY];
         self.path = self.game_history.clone();
 
+        // Libro de aperturas: se consulta para CUALQUIER turno (blancas o
+        // negras -- la clave Polyglot ya codifica de quien es el turno), no
+        // solo cuando el motor abre la partida.
+        if let Some(mv) = crate::polyglot::probe(b) {
+            on_info(1, 0, 0, 0);
+            return (Some(mv), 0, 1);
+        }
+
         // Tabla de finales en la raiz: DTZ da la jugada que progresa de
         // verdad hacia el resultado optimo (no solo "no perder"), asi que
         // reemplaza directamente lo que hubiera elegido la busqueda normal
