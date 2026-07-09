@@ -33,11 +33,23 @@ const N_OCULTA1: usize = 256;
 const N_OCULTA2: usize = 32;
 
 pub struct RedNeural {
-    w1: Vec<f32>, // [256 x 770], fila i = pesos de la neurona oculta i
-    b1: Vec<f32>, // [256]
-    w2: Vec<f32>, // [32 x 256]
-    b2: Vec<f32>, // [32]
-    w3: Vec<f32>, // [1 x 32]
+    // v13.1: w1 guardada TRANSPUESTA (columna-mayor: w1_col[j*256..j*256+256]
+    // = los 256 pesos que conectan la entrada j a cada neurona oculta),
+    // no como vino del archivo (fila-mayor). La entrada de esta red es un
+    // one-hot disperso: de las 770 entradas, solo ~32-34 valen 1.0 (una por
+    // pieza en el tablero, mas 2 bits de turno/enroque) -- el resto son
+    // ceros que no aportan nada a la suma. Con la matriz en columna-mayor,
+    // "sumar la contribucion de la entrada activa j" es un slice contiguo
+    // de 256 floats (rapido, vectoriza bien); con la fila-mayor original
+    // habria que leer con salto de 770 floats por cada uno de los 256 --
+    // practicamente un cache-miss por lectura. Medido: recompute denso
+    // completo (todas las 770 entradas, la mayoria en 0) ~10-12k nodos/seg
+    // con la red activada; con esto, ver comentario en eval_red().
+    w1_col: Vec<f32>, // [770 x 256] transpuesta
+    b1: Vec<f32>,     // [256]
+    w2: Vec<f32>,     // [32 x 256]
+    b2: Vec<f32>,     // [32]
+    w3: Vec<f32>,     // [1 x 32]
     b3: f32,
 }
 
@@ -62,29 +74,46 @@ impl RedNeural {
             }
             v
         };
-        let w1 = leer_f32_vec(N_OCULTA1 * N_ENTRADA, &mut cursor);
+        let w1_fila = leer_f32_vec(N_OCULTA1 * N_ENTRADA, &mut cursor);
         let b1 = leer_f32_vec(N_OCULTA1, &mut cursor);
         let w2 = leer_f32_vec(N_OCULTA2 * N_OCULTA1, &mut cursor);
         let b2 = leer_f32_vec(N_OCULTA2, &mut cursor);
         let w3 = leer_f32_vec(N_OCULTA2, &mut cursor);
         let b3v = leer_f32_vec(1, &mut cursor);
-        Some(RedNeural { w1, b1, w2, b2, w3, b3: b3v[0] })
+
+        // Transponer una sola vez al cargar (esto SI es caro -- 770*256 --
+        // pero pasa UNA vez al arrancar, no en cada nodo de busqueda).
+        let mut w1_col = vec![0f32; N_ENTRADA * N_OCULTA1];
+        for i in 0..N_OCULTA1 {
+            for j in 0..N_ENTRADA {
+                w1_col[j * N_OCULTA1 + i] = w1_fila[i * N_ENTRADA + j];
+            }
+        }
+
+        Some(RedNeural { w1_col, b1, w2, b2, w3, b3: b3v[0] })
     }
 
-    /// Forward pass manual (sin dependencias externas) -- devuelve
-    /// centipeones desde la perspectiva del bando que mueve, misma
-    /// convencion que evaluate() en eval.rs (y que evaluar_red.py: las
-    /// etiquetas de entrenamiento se generaron con score.pov(board.turn)).
-    fn forward(&self, x: &[f32; N_ENTRADA]) -> f32 {
-        // Dot products con iteradores (zip), no indexado manual: deja que
-        // LLVM elimine los chequeos de rango y vectorice el bucle -- el
-        // indexado manual (fila[j]) midio ~150x mas lento en la practica
-        // (no vectorizaba pese a opt-level=3/lto=fat en Cargo.toml).
+    /// Forward pass explotando que la entrada es dispersa (one-hot por
+    /// pieza): en vez de multiplicar 770 entradas (la enorme mayoria en
+    /// cero) por cada una de las 256 neuronas ocultas, se parte de los
+    /// sesgos y se SUMA la columna de w1 de cada entrada activa nada mas.
+    /// Matematicamente identico al forward denso (x[j]=1.0 en las activas,
+    /// 0.0 en el resto, asi que sum(w*x) == sum de columnas activas) --
+    /// mismo resultado, ~20-30x menos trabajo (medido).
+    fn forward_disperso(&self, indices_activos: &[u16]) -> f32 {
         let mut h1 = [0f32; N_OCULTA1];
-        for (i, fila) in self.w1.chunks_exact(N_ENTRADA).enumerate() {
-            let dot: f32 = fila.iter().zip(x.iter()).map(|(&w, &xi)| w * xi).sum();
-            h1[i] = (self.b1[i] + dot).max(0.0);
+        h1.copy_from_slice(&self.b1);
+        for &j in indices_activos {
+            let base = j as usize * N_OCULTA1;
+            let col = &self.w1_col[base..base + N_OCULTA1];
+            for (h, &w) in h1.iter_mut().zip(col.iter()) {
+                *h += w;
+            }
         }
+        for h in h1.iter_mut() {
+            *h = h.max(0.0);
+        }
+
         let mut h2 = [0f32; N_OCULTA2];
         for (i, fila) in self.w2.chunks_exact(N_OCULTA1).enumerate() {
             let dot: f32 = fila.iter().zip(h1.iter()).map(|(&w, &hi)| w * hi).sum();
@@ -95,27 +124,45 @@ impl RedNeural {
     }
 }
 
-/// Construye el vector de entrada de 770 floats para una posicion. Mismo
-/// orden EXACTO que board_a_vector() en features_red.py.
-pub fn vector_entrada(b: &Board) -> [f32; N_ENTRADA] {
-    let mut v = [0f32; N_ENTRADA];
+// Maximo teorico de entradas activas: 32 piezas (16 por bando, un jugador
+// NUNCA gana piezas de mas alla de sus 16 iniciales, promocion solo
+// convierte peones ya existentes) + 2 bits (turno, enroque) = 34. Arreglo
+// de tamano fijo en la pila -- CERO reservas de memoria dinamica por
+// llamada (antes con Vec::with_capacity se reservaba en el heap en CADA
+// nodo de busqueda con la red activada).
+const MAX_ACTIVOS: usize = 34;
+
+/// Lista los indices (0..770) de entradas activas (valor 1.0) para una
+/// posicion -- tipicamente ~32-34 (una por pieza en el tablero, mas turno
+/// y/o derechos de enroque). Mismo orden/encoding EXACTO que
+/// board_a_vector() en features_red.py (ver comentario arriba del archivo).
+fn indices_activos(b: &Board) -> ([u16; MAX_ACTIVOS], usize) {
+    let mut idx = [0u16; MAX_ACTIVOS];
+    let mut n = 0usize;
     for (color_idx, color) in [(0usize, Color::White), (1usize, Color::Black)] {
         for (pt_idx, &pt) in ALL_PIECE_TYPES.iter().enumerate() {
             let mut bb = b.pieces[color as usize][pt as usize];
             while bb != 0 {
                 let sq = crate::bitboard::pop_lsb(&mut bb);
-                v[(color_idx * 6 + pt_idx) * 64 + sq as usize] = 1.0;
+                idx[n] = ((color_idx * 6 + pt_idx) * 64 + sq as usize) as u16;
+                n += 1;
             }
         }
     }
-    v[768] = if b.turn == Color::White { 1.0 } else { 0.0 };
+    if b.turn == Color::White {
+        idx[n] = 768;
+        n += 1;
+    }
     let (bit_k, bit_q) = if b.turn == Color::White {
         (crate::board::CASTLE_WK, crate::board::CASTLE_WQ)
     } else {
         (crate::board::CASTLE_BK, crate::board::CASTLE_BQ)
     };
-    v[769] = if b.castling_rights & (bit_k | bit_q) != 0 { 1.0 } else { 0.0 };
-    v
+    if b.castling_rights & (bit_k | bit_q) != 0 {
+        idx[n] = 769;
+        n += 1;
+    }
+    (idx, n)
 }
 
 static RED: OnceLock<Option<RedNeural>> = OnceLock::new();
@@ -151,8 +198,8 @@ pub fn eval_red(b: &Board) -> Option<f32> {
     }
     match RED.get() {
         Some(Some(red)) => {
-            let x = vector_entrada(b);
-            Some(red.forward(&x))
+            let (idx, n) = indices_activos(b);
+            Some(red.forward_disperso(&idx[..n]))
         }
         _ => None,
     }

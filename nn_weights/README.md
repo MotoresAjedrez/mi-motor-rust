@@ -41,16 +41,35 @@ con `neural.rs::vector_entrada`:
 - 768: 1.0 si mueven las blancas, 0.0 si mueven las negras.
 - 769: 1.0 si el bando que mueve conserva algún derecho de enroque.
 
-## Estado de rendimiento (medido, v13)
+## Estado de rendimiento (medido, v13.1)
 
-**Advertencia honesta, no un "por si acaso":** con esta arquitectura (recompute
-completo en cada llamada a `evaluate()`, sin accumulator incremental tipo
-NNUE real) la velocidad de búsqueda cae de ~2,000,000 nodos/seg a
-~10,000-12,000 nodos/seg cuando `UseNN` está activado -- más de 100 veces
-más lento. Por eso queda **apagada por defecto** y no se recomienda
-activarla en juego real todavía: la pérdida de profundidad de búsqueda
-probablemente pesa mucho más que cualquier mejora de precisión de la red.
-Para que esto sea usable en partidas reales hace falta un accumulator
-incremental de verdad (actualizar solo el efecto de la pieza que se movió
-en cada jugada, no recalcular las 770 entradas desde cero) -- eso es
-trabajo de una sesión aparte, no un ajuste rápido.
+Primera versión (recompute denso de las 770 entradas en cada llamada):
+~10,000-12,000 nodos/seg con `UseNN` activado, más de 100x más lento que
+sin la red (~2,000,000 nodos/seg) -- impracticable para juego real.
+
+**Optimización aplicada (v13.1)**: la entrada de la red es un one-hot
+disperso -- de las 770 entradas, solo ~32-34 valen 1.0 (una por pieza en
+el tablero, más los bits de turno/enroque), el resto son ceros que no
+aportan nada. En vez de recorrer las 770 entradas, el forward pass ahora
+parte de los sesgos y SUMA solo la columna de pesos de cada entrada
+activa (matemáticamente idéntico al cálculo denso -- verificado
+comparando el score exacto en cada profundidad antes/después, coinciden
+bit a bit). Además, la matriz de la primera capa se guarda transpuesta
+(columna-mayor) para que cada suma sea un acceso contiguo a memoria, y
+el forward pass no reserva memoria dinámica por llamada (arreglos de
+tamaño fijo en la pila, no `Vec`).
+
+**Resultado medido**: ~290,000-330,000 nodos/seg con `UseNN` activado --
+de >100x más lento a **~6-7x más lento** que sin la red. Sigue siendo un
+costo real (algo así como 1.5-2 plies menos de profundidad efectiva en
+el mismo tiempo), pero ya es un trade-off razonable a evaluar, no algo
+impracticable. Sin `UseNN` activado, el costo sigue siendo CERO (medido:
+~2,000,000-2,400,000 nodos/seg, idéntico a sin la red).
+
+**Nota**: esto sigue sin ser NNUE real -- un accumulator incremental de
+verdad (actualizar solo el efecto de la pieza que se movió jugada a
+jugada, sin recalcular ni siquiera las ~32 entradas activas desde cero
+en cada nodo) daría otra mejora sustancial encima de esta, pero requiere
+tocar la recursión de `negamax` en `search.rs` para llevar el estado del
+accumulator ply por ply -- un cambio de mayor riesgo/alcance que se dejó
+fuera de esta pasada a propósito, dado lo sensible que es esa función.
