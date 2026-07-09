@@ -254,9 +254,23 @@ impl Searcher {
         }
     }
 
+    // v12: politica de reemplazo "prefiere profundidad" -- antes se
+    // sobreescribia SIEMPRE sin condicion, asi que una entrada profunda (cara
+    // de calcular, muy valiosa) se podia perder por una superficial que cayo
+    // en el mismo casillero (quiescence guarda con depth<=0, por ejemplo).
+    // Ahora solo se reemplaza si la entrada nueva es igual o mas profunda que
+    // la que ya esta (o el casillero esta vacio) -- protege las entradas
+    // caras sin necesitar un esquema de "generacion/antiguedad" mas complejo.
     fn tt_store(&mut self, key: u64, depth: i32, score: i32, flag: TTFlag, best: Option<Move>) {
         let idx = self.tt_index(key);
-        *self.tt[idx].lock().unwrap() = Some(TTEntry { key, depth, score, flag, best });
+        let mut slot = self.tt[idx].lock().unwrap();
+        let reemplazar = match *slot {
+            None => true,
+            Some(existing) => depth >= existing.depth,
+        };
+        if reemplazar {
+            *slot = Some(TTEntry { key, depth, score, flag, best });
+        }
     }
 
     fn check_time(&mut self) -> Result<(), TimeUp> {
@@ -333,7 +347,19 @@ impl Searcher {
             alpha = stand_pat;
         }
 
-        let mut moves: Vec<Move> = generate_pseudo_legal(b).into_iter().filter(|m| m.is_capture()).collect();
+        // v12: ademas de capturas, se incluyen promociones a dama SIN captura
+        // (peon que corona caminando). Sin esto, un peon a un paso de coronar
+        // podia quedar fuera de quiescence por completo (solo capturas) --
+        // efecto horizonte clasico en finales de peones pasados: la busqueda
+        // principal SI ve la coronacion (genera todas las jugadas legales),
+        // pero si quiescence corta ahi antes de esa jugada especifica, evalua
+        // con stand_pat sin haber "visto" que el peon corona. Sub-promociones
+        // (a torre/alfil/caballo) casi nunca son mejores que coronar dama, no
+        // vale la pena el costo de tambien incluirlas aqui.
+        let mut moves: Vec<Move> = generate_pseudo_legal(b)
+            .into_iter()
+            .filter(|m| m.is_capture() || m.promotion == Some(crate::types::PieceType::Queen))
+            .collect();
         self.order_moves(b, &mut moves, None);
 
         let mut best = stand_pat;
@@ -479,21 +505,26 @@ impl Searcher {
         // ply extra de profundidad real en vez de recortarse igual que
         // cualquier otra. Apagado por defecto (modo_singular), ver comentario
         // en la definicion del campo.
-        // SE_PROF_MIN=8 (no 6): medido en la practica que con 6 el costo por
-        // nodo elegible se multiplica a lo largo de TODO el arbol (no solo
-        // en la raiz) y en posiciones con mucho material/jaques dispara el
-        // tiempo por un factor >>2x incluso con el freno anti-anidamiento
-        // (en_sondeo_se) ya puesto -- una posicion tardo 5+ minutos en
-        // profundidad fija 9. Con 8, la sonda solo dispara cerca de la raiz
-        // (la profundidad baja rapido bajando por el arbol), acotando el
-        // costo total sin perder el caso de uso principal (decisiones
-        // criticas tempranas en la busqueda).
+        // v12: encontrados DOS desvios del algoritmo estandar que explican
+        // la explosion medida en v11 (no era la tecnica, era la condicion de
+        // activacion demasiado permisiva):
+        //  1) Aceptaba entradas TT con flag Exact ademas de Beta. Beta
+        //     (fail-high real, cota inferior) es la UNICA que tiene sentido
+        //     para esta prueba -- es la que dice "esta jugada ya demostro
+        //     ser >= beta". Exact son nodos PV normales (alpha<score<beta),
+        //     mucho mas frecuentes que los Beta, y probarlos multiplicaba la
+        //     cantidad de nodos que disparaban la sonda por todo el arbol.
+        //  2) No excluia jaque: en posiciones con jaque el numero de
+        //     respuestas legales suele ser bajo (casi cualquier jugada
+        //     "parece" singular) y la extension de jaque ya existente puede
+        //     encadenarse con la sonda de verificacion, multiplicando el
+        //     costo sin aportar nada (la extension de jaque ya cubre ese caso).
         const SE_PROF_MIN: i32 = 8;
         let mut jugada_singular: Option<Move> = None;
-        if self.modo_singular && !en_sondeo_se && ply > 0 && depth >= SE_PROF_MIN {
+        if self.modo_singular && !en_sondeo_se && !en_jaque && ply > 0 && depth >= SE_PROF_MIN {
             if let (Some(entry), Some(tmv)) = (tt_entry_full, tt_move) {
                 if entry.depth >= depth - 3
-                    && matches!(entry.flag, TTFlag::Beta | TTFlag::Exact)
+                    && entry.flag == TTFlag::Beta
                     && entry.score.abs() < MATE - 1000
                     && moves.contains(&tmv)
                 {
@@ -888,9 +919,18 @@ pub fn buscar_lazy_smp(
     let resultados: Vec<ResultadoHilo> = handles.into_iter().map(|h| h.join().expect("hilo de busqueda con panic")).collect();
 
     let nodos_totales: u64 = resultados.iter().map(|r| r.nodos).sum();
+    // v12: NO usar score.abs() para desempatar entre hilos con la misma
+    // profundidad. Todos buscan la MISMA posicion raiz con el MISMO bando a
+    // mover, asi que un score mas alto es sencillamente mejor -- no hace
+    // falta "decision" alguna. Con abs(), un hilo que por suerte de orden de
+    // jugadas NO vio una refutacion real (score optimista, ej. +400) le
+    // ganaba a otro hilo que SI la encontro (score correcto pero cauteloso,
+    // ej. -50), porque |400| > |-50| -- eligiendo la evaluacion equivocada
+    // con mas confianza en vez de la correcta. Score crudo (sin abs) elige
+    // siempre la mejor evaluacion real entre los hilos empatados en profundidad.
     let mejor = resultados
         .iter()
-        .max_by_key(|r| (r.profundidad, r.score.abs()))
+        .max_by_key(|r| (r.profundidad, r.score))
         .expect("al menos un hilo");
 
     (mejor.mv, mejor.score, nodos_totales, resultados)
