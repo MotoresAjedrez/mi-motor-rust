@@ -2,6 +2,7 @@ mod bitboard;
 mod board;
 mod eval;
 mod movegen;
+mod neural;
 mod perft;
 mod polyglot;
 mod polyglot_random;
@@ -24,6 +25,30 @@ const STARTPOS: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1
 const KIWIPETE: &str = "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1";
 const POSITION3: &str = "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1";
 const POSITION5: &str = "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 0 1";
+
+/// Modo comodo para probar una posicion suelta sin protocolo UCI:
+///   mimotor-tal-rust simple "FEN"
+///   mimotor-tal-rust simple 3000 "FEN"   (movetime en ms, default 2000)
+fn run_simple(fen: &str, movetime_ms: u64) {
+    let b = match Board::from_fen(fen) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("FEN invalido: {}", e);
+            return;
+        }
+    };
+    let mut s = Searcher::new(64);
+    let (mv, sc, prof) = s.search_time(&b, Some(movetime_ms), 64, |_, _, _, _| {});
+    let pv = s.extraer_pv(&b, 12);
+    let pv_txt = pv.iter().map(|m| m.to_uci()).collect::<Vec<_>>().join(" ");
+    println!("================ MiMotor Tal ================");
+    println!("Mejor jugada: {}", mv.map(|m| m.to_uci()).unwrap_or_else(|| "0000".to_string()));
+    println!("Evaluacion: {:+.2}", sc as f64 / 100.0);
+    println!("Profundidad: {}", prof);
+    println!("Nodos: {}", s.nodes);
+    println!("Linea principal: {}", if pv_txt.is_empty() { "(no disponible)" } else { &pv_txt });
+    println!("===============================================");
+}
 
 fn run_perft_suite() {
     let cases: Vec<(&str, &str, Vec<u64>)> = vec![
@@ -550,6 +575,8 @@ fn uci_loop() {
                 println!("option name SyzygyPath type string default <empty>");
                 println!("option name BookPath type string default <empty>");
                 println!("option name OwnBook type check default true");
+                println!("option name UseNN type check default false");
+                println!("option name NNPath type string default <empty>");
                 println!("uciok");
                 io::stdout().flush().ok();
             }
@@ -595,6 +622,18 @@ fn uci_loop() {
                     } else if nombre.eq_ignore_ascii_case("ownbook") {
                         if let Some(v) = valor {
                             polyglot::set_activo(v.eq_ignore_ascii_case("true"));
+                        }
+                    } else if nombre.eq_ignore_ascii_case("nnpath") {
+                        if let Some(path) = valor {
+                            if neural::cargar(path) {
+                                println!("info string red neuronal cargada desde {}", path);
+                            } else {
+                                println!("info string error cargando red neuronal desde {} (revisar ruta/tamano de archivo)", path);
+                            }
+                        }
+                    } else if nombre.eq_ignore_ascii_case("usenn") {
+                        if let Some(v) = valor {
+                            neural::set_activa(v.eq_ignore_ascii_case("true"));
                         }
                     }
                 }
@@ -792,6 +831,15 @@ fn main() {
             "singulartest" => {
                 let depth: i32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(9);
                 run_singular_diagnostico(depth);
+                return;
+            }
+            "simple" if args.len() >= 3 => {
+                let (movetime, fen_inicio) = match args.get(2).and_then(|s| s.parse::<u64>().ok()) {
+                    Some(ms) if args.len() >= 4 => (ms, 3usize),
+                    _ => (2000u64, 2usize),
+                };
+                let fen = args[fen_inicio..].join(" ");
+                run_simple(&fen, movetime);
                 return;
             }
             "smpbench" => {

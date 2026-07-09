@@ -242,6 +242,34 @@ impl Searcher {
         self.game_history = hist;
     }
 
+    /// Reconstruye la linea principal (PV) caminando la TT desde `b`,
+    /// siguiendo la mejor jugada guardada en cada posicion. Se corta por
+    /// `max_len`, por no encontrar entrada en la TT, o por repeticion de
+    /// zobrist (posible en ciclos/tablas) -- nunca deberia colgarse.
+    /// Uso: solo para mostrar informacion (modo "simple", UCI "info pv"),
+    /// no participa de la busqueda en si.
+    pub fn extraer_pv(&self, b: &Board, max_len: usize) -> Vec<Move> {
+        let mut pv = Vec::with_capacity(max_len);
+        let mut vistos = Vec::with_capacity(max_len);
+        let mut actual = *b;
+        for _ in 0..max_len {
+            if vistos.contains(&actual.zobrist) {
+                break;
+            }
+            vistos.push(actual.zobrist);
+            let mv = match self.tt_probe(actual.zobrist).and_then(|e| e.best) {
+                Some(mv) => mv,
+                None => break,
+            };
+            if !generate_legal(&actual).contains(&mv) {
+                break;
+            }
+            pv.push(mv);
+            actual = actual.make_move(&mv);
+        }
+        pv
+    }
+
     fn tt_index(&self, key: u64) -> usize {
         (key as usize) & self.tt_mask
     }
@@ -845,6 +873,13 @@ impl Searcher {
                     break;
                 }
             }
+        }
+        // La raiz nunca pasa por negamax (el loop de arriba la maneja
+        // aparte), asi que sin esto la TT no tiene entrada para ella y
+        // extraer_pv() no puede ni arrancar a caminarla. Guardarla aca no
+        // afecta la busqueda en si (pasa DESPUES del loop).
+        if let Some(mv) = mejor_mv {
+            self.tt_store(b.zobrist, mejor_prof, mejor_sc, TTFlag::Exact, Some(mv));
         }
         (mejor_mv, mejor_sc, mejor_prof)
     }

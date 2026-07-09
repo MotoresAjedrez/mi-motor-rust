@@ -563,5 +563,18 @@ pub fn evaluate(b: &Board) -> i32 {
 
     let total_i = total.round() as i32;
     let perspectiva = if b.turn == Color::White { total_i } else { -total_i };
-    perspectiva + TEMPO
+    let clasica = perspectiva + TEMPO;
+
+    // v13: correccion opcional de una red neuronal ligera (ver neural.rs),
+    // APAGADA por defecto (UCI "UseNN"). Aditiva, no reemplaza la
+    // evaluacion clasica -- eval_final = eval_clasica + peso_red*eval_red,
+    // con peso_red chico a proposito: la red es una correccion, no un
+    // reemplazo de algo ya probado en cientos de partidas. Si no esta
+    // activada o no hay pesos cargados, eval_red() devuelve None y esto
+    // es exactamente lo mismo que antes (cero costo, cero cambio).
+    const PESO_RED: f64 = 0.2;
+    match crate::neural::eval_red(b) {
+        Some(red_cp) => clasica + (PESO_RED * red_cp as f64).round() as i32,
+        None => clasica,
+    }
 }
