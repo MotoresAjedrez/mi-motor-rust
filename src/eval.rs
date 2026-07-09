@@ -47,7 +47,17 @@ const TEMPO: i32 = 12;
 
 const PESO_MOV: [i32; 6] = [0, 4, 4, 3, 1, 0];
 const PESO_ATQ: [i32; 6] = [0, 2, 2, 3, 5, 0];
-const FACTOR_ATAQUE_TAL: f64 = 1.45;
+// v12: bajado de 1.45 a 1.15. Diagnostico de divergencia contra Stockfish
+// (profundidad 18) en las posiciones criticas de 2 derrotas reales contra
+// simpleEval mostro a Tal sobreestimando la posicion propia por 100-380cp de
+// forma sostenida -- comparado en la MISMA posicion, Universal (factor 1.0)
+// daba un numero mucho mas cercano a Stockfish. 1.45 inflaba demasiado el
+// termino de ataque al rey (hasta +225cp extra en zonas muy atacadas), dando
+// confianza excesiva en complicaciones sin comprobar si de verdad progresan.
+// 1.15 mantiene la identidad agresiva (sigue por encima del 1.0 neutral de
+// Universal) sin el sesgo tan marcado. Verificado con torneo h2h antes de
+// aceptarlo (ver resultados_tal_calibrado_h2h.txt).
+const FACTOR_ATAQUE_TAL: f64 = 1.15;
 const FACTOR_ATAQUE_UNIVERSAL: f64 = 1.0; // ataque al rey de peso normal, sin el bono no-lineal agresivo de Tal
 
 const TABLA_SEGURIDAD: [i32; 62] = [
