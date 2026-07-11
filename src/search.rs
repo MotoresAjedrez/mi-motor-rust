@@ -4,7 +4,8 @@
 // en el reporte final de la sesion).
 
 use crate::board::Board;
-use crate::eval::evaluate;
+use crate::eval::evaluate_with_nnue;
+use crate::neural::{crear_acumulador, NnueAccumulator};
 use crate::movegen::{generate_legal, generate_pseudo_legal};
 use crate::types::{Move, MoveFlag};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,8 +28,8 @@ const MAX_PLY: u32 = 64;
 const CONTEMPT_UMBRAL: i32 = 500;
 const CONTEMPT_PENALIZACION: i32 = 200;
 
-fn draw_score(b: &Board) -> i32 {
-    let se = evaluate(b);
+fn draw_score(b: &Board, nnue: Option<&NnueAccumulator>) -> i32 {
+    let se = evaluate_with_nnue(b, nnue);
     if se > CONTEMPT_UMBRAL {
         -CONTEMPT_PENALIZACION
     } else if se < -CONTEMPT_UMBRAL {
@@ -304,17 +305,11 @@ impl Searcher {
     fn check_time(&mut self) -> Result<(), TimeUp> {
         self.nodes += 1;
         if !self.stop && self.nodes & 1023 == 0 {
-            if let Some(dl) = self.deadline {
-                if Instant::now() >= dl {
-                    self.stop = true;
-                }
+            if let Some(dl) = self.deadline && Instant::now() >= dl {
+                self.stop = true;
             }
-            if !self.stop {
-                if let Some(flag) = &self.external_stop {
-                    if flag.load(Ordering::Relaxed) {
-                        self.stop = true;
-                    }
-                }
+            if !self.stop && let Some(flag) = &self.external_stop && flag.load(Ordering::Relaxed) {
+                self.stop = true;
             }
         }
         if self.stop {
@@ -324,7 +319,7 @@ impl Searcher {
         }
     }
 
-    fn order_moves(&self, b: &Board, moves: &mut Vec<Move>, tt_move: Option<Move>) {
+    fn order_moves(&self, b: &Board, moves: &mut [Move], tt_move: Option<Move>) {
         self.order_moves_ply(b, moves, tt_move, MAX_KILLER_PLY as u32, None);
     }
 
@@ -333,7 +328,7 @@ impl Searcher {
     /// `prev` es (pieza, casillero_destino) de la jugada rival que llevo a
     /// esta posicion (None si no se conoce, p.ej. en la raiz) -- alimenta la
     /// continuation history para las jugadas silenciosas.
-    fn order_moves_ply(&self, b: &Board, moves: &mut Vec<Move>, tt_move: Option<Move>, ply: u32, prev: Option<(usize, usize)>) {
+    fn order_moves_ply(&self, b: &Board, moves: &mut [Move], tt_move: Option<Move>, ply: u32, prev: Option<(usize, usize)>) {
         let p = ply as usize;
         let killers = if p < MAX_KILLER_PLY { Some(self.killers[p]) } else { None };
         moves.sort_by_key(|mv| {
@@ -362,12 +357,49 @@ impl Searcher {
         });
     }
 
-    fn quiescence(&mut self, b: &Board, mut alpha: i32, beta: i32, ply: u32) -> Result<i32, TimeUp> {
+    fn quiescence(&mut self, b: &Board, nnue: Option<&NnueAccumulator>, mut alpha: i32, beta: i32, ply: u32) -> Result<i32, TimeUp> {
         self.check_time()?;
-        let stand_pat = evaluate(b);
+
         if ply >= MAX_PLY {
-            return Ok(stand_pat);
+            return Ok(evaluate_with_nnue(b, nnue));
         }
+
+        // v13: en jaque, "plantarse" con stand_pat no tiene sentido -- las
+        // unicas jugadas legales son evasiones, y si no hay ninguna es mate.
+        // Sin este caso especial, quiescence podia devolver la evaluacion
+        // estatica de una posicion donde el unico resultado real es mate o
+        // una evasion forzada muy mala (efecto horizonte real, no una
+        // exageracion -- confirmado con casos de prueba especificos antes de
+        // activar esto). En jaque se buscan TODAS las evasiones legales (no
+        // solo capturas) y sin las podas normales de quiescence (delta/SEE),
+        // que asumen que hay una alternativa silenciosa razonable -- en
+        // jaque no la hay por definicion.
+        if b.in_check(b.turn) {
+            let evasiones = generate_legal(b);
+            if evasiones.is_empty() {
+                return Ok(-MATE + ply as i32);
+            }
+            let mut mejor = -INFINITO;
+            let mut ordenadas = evasiones;
+            self.order_moves(b, &mut ordenadas, None);
+            for mv in ordenadas {
+                let next = b.make_move(&mv);
+                let next_nnue = nnue.map(|acumulador| acumulador.despues_de_jugada(b, &next));
+                let sc = -self.quiescence(&next, next_nnue.as_ref(), -beta, -alpha, ply + 1)?;
+                if sc > mejor {
+                    mejor = sc;
+                }
+                if sc > alpha {
+                    alpha = sc;
+                }
+                if alpha >= beta {
+                    break;
+                }
+            }
+            return Ok(mejor);
+        }
+
+        let stand_pat = evaluate_with_nnue(b, nnue);
         if stand_pat >= beta {
             return Ok(beta);
         }
@@ -414,7 +446,8 @@ impl Searcher {
             if next.in_check(b.turn) {
                 continue; // ilegal: propio rey quedaria en jaque
             }
-            let sc = -self.quiescence(&next, -beta, -alpha, ply + 1)?;
+            let next_nnue = nnue.map(|acumulador| acumulador.despues_de_jugada(b, &next));
+            let sc = -self.quiescence(&next, next_nnue.as_ref(), -beta, -alpha, ply + 1)?;
             if sc > best {
                 best = sc;
             }
@@ -437,11 +470,12 @@ impl Searcher {
     // nodo entra en modo verificacion, TODOS sus descendientes lo heredan
     // (se propaga, no se resetea a cada paso) y ninguno intenta su propia
     // singular extension.
-    fn negamax(&mut self, b: &Board, mut depth: i32, mut alpha: i32, beta: i32, ply: u32, prev: Option<(usize, usize)>, en_sondeo_se: bool) -> Result<i32, TimeUp> {
+    #[allow(clippy::collapsible_if, clippy::too_many_arguments)]
+    fn negamax(&mut self, b: &Board, nnue: Option<&NnueAccumulator>, mut depth: i32, mut alpha: i32, beta: i32, ply: u32, prev: Option<(usize, usize)>, en_sondeo_se: bool) -> Result<i32, TimeUp> {
         self.check_time()?;
 
         if b.halfmove_clock >= 100 {
-            return Ok(draw_score(b));
+            return Ok(draw_score(b, nnue));
         }
 
         // Repeticion: si esta posicion ya aparecio entre los ancestros
@@ -456,7 +490,7 @@ impl Searcher {
         if hc > 0 {
             let start = self.path.len().saturating_sub(hc);
             if self.path[start..].contains(&b.zobrist) {
-                return Ok(draw_score(b));
+                return Ok(draw_score(b, nnue));
             }
         }
 
@@ -467,10 +501,8 @@ impl Searcher {
         // dentro del arbol de busqueda. No se prueba en la raiz (eso lo
         // maneja search_time/search_fixed_depth aparte, via DTZ, para elegir
         // la jugada que progresa de verdad, no solo el resultado).
-        if ply > 0 {
-            if let Some(wdl) = crate::syzygy::probe_wdl(b) {
-                return Ok(wdl);
-            }
+        if ply > 0 && let Some(wdl) = crate::syzygy::probe_wdl(b) {
+            return Ok(wdl);
         }
 
         let en_jaque = b.in_check(b.turn);
@@ -479,7 +511,7 @@ impl Searcher {
         }
 
         if depth <= 0 || ply >= MAX_PLY {
-            return self.quiescence(b, alpha, beta, ply);
+            return self.quiescence(b, nnue, alpha, beta, ply);
         }
 
         let alpha_orig = alpha;
@@ -512,7 +544,8 @@ impl Searcher {
             && !solo_peones_y_rey(b, b.turn)
         {
             let next = b.make_null_move();
-            let sc_null = -self.negamax(&next, depth - 1 - NULL_MOVE_R, -beta, -beta + 1, ply + 1, None, en_sondeo_se)?;
+            let next_nnue = nnue.map(|acumulador| acumulador.despues_de_jugada(b, &next));
+            let sc_null = -self.negamax(&next, next_nnue.as_ref(), depth - 1 - NULL_MOVE_R, -beta, -beta + 1, ply + 1, None, en_sondeo_se)?;
             if sc_null >= beta {
                 return Ok(beta);
             }
@@ -566,7 +599,8 @@ impl Searcher {
                             continue;
                         }
                         let next = b.make_move(mv);
-                        match self.negamax(&next, sdepth, -sbeta, -sbeta + 1, ply + 1, None, true) {
+                        let next_nnue = nnue.map(|acumulador| acumulador.despues_de_jugada(b, &next));
+                        match self.negamax(&next, next_nnue.as_ref(), sdepth, -sbeta, -sbeta + 1, ply + 1, None, true) {
                             Ok(v) => {
                                 let sc = -v;
                                 if sc > mejor_otra {
@@ -618,6 +652,7 @@ impl Searcher {
 
             let pt_mv = b.piece_at(mv.from).map(|(_, pt)| pt as usize).unwrap_or(0);
             let next = b.make_move(mv);
+            let next_nnue = nnue.map(|acumulador| acumulador.despues_de_jugada(b, &next));
             let child_prev = Some((pt_mv, mv.to as usize));
             let ext = if jugada_singular == Some(*mv) { 1 } else { 0 };
             let sc = if es_reducible && !next.in_check(next.turn) {
@@ -628,15 +663,15 @@ impl Searcher {
                 // cuanto mejor. Es un bound, no un valor exacto: si supera
                 // alfa, no se confia en el numero, se re-busca a profundidad
                 // Y ventana completas para obtener el valor real.
-                let sondeo = -self.negamax(&next, depth - 1 + ext - r, -alpha - 1, -alpha, ply + 1, child_prev, en_sondeo_se)?;
+                let sondeo = -self.negamax(&next, next_nnue.as_ref(), depth - 1 + ext - r, -alpha - 1, -alpha, ply + 1, child_prev, en_sondeo_se)?;
                 if sondeo > alpha {
                     self.lmr_reintentos += 1;
-                    -self.negamax(&next, depth - 1 + ext, -beta, -alpha, ply + 1, child_prev, en_sondeo_se)?
+                    -self.negamax(&next, next_nnue.as_ref(), depth - 1 + ext, -beta, -alpha, ply + 1, child_prev, en_sondeo_se)?
                 } else {
                     sondeo
                 }
             } else {
-                -self.negamax(&next, depth - 1 + ext, -beta, -alpha, ply + 1, child_prev, en_sondeo_se)?
+                -self.negamax(&next, next_nnue.as_ref(), depth - 1 + ext, -beta, -alpha, ply + 1, child_prev, en_sondeo_se)?
             };
 
             if sc > best_score {
@@ -665,6 +700,19 @@ impl Searcher {
         Ok(best_score)
     }
 
+    /// Wrapper publico solo para pruebas dirigidas de quiescence (p.ej. el
+    /// comando CLI "quiescheck") -- llama a quiescence() directo, sin pasar
+    /// por negamax, para poder construir posiciones especificas (jaque con
+    /// una sola evasion, mate inmediato, etc.) y verificar el resultado
+    /// exacto de esa funcion sola.
+    pub fn quiescence_test(&mut self, b: &Board) -> i32 {
+        self.nodes = 0;
+        self.deadline = None;
+        self.stop = false;
+        self.path = self.game_history.clone();
+        self.quiescence(b, None, -INFINITO, INFINITO, 0).unwrap_or(0)
+    }
+
     /// Busqueda con profundidad fija (para benchmarks/tests, sin limite de tiempo).
     pub fn search_fixed_depth(&mut self, b: &Board, depth: i32) -> (Option<Move>, i32, u64) {
         self.nodes = 0;
@@ -672,6 +720,7 @@ impl Searcher {
         self.stop = false;
         self.killers = vec![[None, None]; MAX_KILLER_PLY];
         self.path = self.game_history.clone();
+        let root_nnue = crear_acumulador(b);
         let mut mejor_mv = None;
         let mut mejor_sc: i32 = -INFINITO;
         for d in 1..=depth {
@@ -689,7 +738,7 @@ impl Searcher {
                 } else {
                     (-INFINITO, INFINITO)
                 };
-            let mut actual_mv = ordered[0];
+            let mut actual_mv;
             let mut actual_sc;
             let mut ancho = VENTANA_INICIAL;
             loop {
@@ -701,7 +750,8 @@ impl Searcher {
                 for mv in &ordered {
                     let pt_mv = b.piece_at(mv.from).map(|(_, pt)| pt as usize).unwrap_or(0);
                     let next = b.make_move(mv);
-                    let sc = match self.negamax(&next, d - 1, -vent_beta, -alpha, 1, Some((pt_mv, mv.to as usize)), false) {
+                    let next_nnue = root_nnue.as_ref().map(|acumulador| acumulador.despues_de_jugada(b, &next));
+                    let sc = match self.negamax(&next, next_nnue.as_ref(), d - 1, -vent_beta, -alpha, 1, Some((pt_mv, mv.to as usize)), false) {
                         Ok(v) => -v,
                         Err(_) => {
                             interrumpido = true;
@@ -750,6 +800,7 @@ impl Searcher {
         self.stop = false;
         self.killers = vec![[None, None]; MAX_KILLER_PLY];
         self.path = self.game_history.clone();
+        let root_nnue = crear_acumulador(b);
 
         // Libro de aperturas: se consulta para CUALQUIER turno (blancas o
         // negras -- la clave Polyglot ya codifica de quien es el turno), no
@@ -805,8 +856,8 @@ impl Searcher {
                 (-INFINITO, INFINITO)
             };
 
-            let mut actual_mv = ordered[0];
-            let mut actual_sc = -INFINITO;
+            let mut actual_mv;
+            let mut actual_sc;
             let mut timed_out = false;
             let mut ancho = VENTANA_INICIAL;
 
@@ -818,7 +869,8 @@ impl Searcher {
                 for mv in &ordered {
                     let pt_mv = b.piece_at(mv.from).map(|(_, pt)| pt as usize).unwrap_or(0);
                     let next = b.make_move(mv);
-                    match self.negamax(&next, d - 1, -vent_beta, -alpha, 1, Some((pt_mv, mv.to as usize)), false) {
+                    let next_nnue = root_nnue.as_ref().map(|acumulador| acumulador.despues_de_jugada(b, &next));
+                    match self.negamax(&next, next_nnue.as_ref(), d - 1, -vent_beta, -alpha, 1, Some((pt_mv, mv.to as usize)), false) {
                         Ok(v) => {
                             let sc = -v;
                             if sc > actual_sc {
@@ -868,10 +920,8 @@ impl Searcher {
             if mejor_sc.abs() >= MATE - 1000 {
                 break;
             }
-            if let Some(ms) = movetime_ms {
-                if inicio.elapsed().as_millis() as u64 > ms * 45 / 100 {
-                    break;
-                }
+            if let Some(ms) = movetime_ms && inicio.elapsed().as_millis() as u64 > ms * 45 / 100 {
+                break;
             }
         }
         // La raiz nunca pasa por negamax (el loop de arriba la maneja
@@ -913,6 +963,7 @@ pub struct ResultadoHilo {
 /// Searcher normal persiste entre llamadas a "go" -- si se reconstruyera
 /// de cero en cada jugada, Lazy SMP perderia la continuidad de la TT entre
 /// plies, una desventaja injusta frente a la version de un solo hilo.
+#[allow(clippy::too_many_arguments)]
 pub fn buscar_lazy_smp(
     b: &Board,
     movetime_ms: Option<u64>,

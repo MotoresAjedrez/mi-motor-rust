@@ -6,8 +6,8 @@
 // de aplicar jugadas reales en la tabla de transposicion / hash, etc.
 
 use crate::bitboard::{
-    bishop_attacks, bit, king_attacks, knight_attacks, lsb, pawn_attacks, queen_attacks,
-    rook_attacks, Bitboard,
+    bishop_attacks, bit, king_attacks, knight_attacks, lsb, pawn_attacks, rook_attacks,
+    Bitboard,
 };
 use crate::board::Board;
 use crate::types::{file_of, make_square, rank_of, Color, Move, MoveFlag, PieceType, Square};

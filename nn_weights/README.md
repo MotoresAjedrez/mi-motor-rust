@@ -1,4 +1,4 @@
-# Pesos de la red neuronal ligera (v13)
+# Pesos NNUE incrementales
 
 `pesos_v1.bin` son los pesos de `~/mi-motor/red_entrenada/pesos.npz`
 (motor Python, arquitectura 770→256(ReLU)→32(ReLU)→1) exportados a un
@@ -26,8 +26,9 @@ with open("pesos_v1.bin", "wb") as f:
 2. Entrenar: `~/mi-motor/entrenar_red.py` (PyTorch, arquitectura fija
    770→256→32→1, labels en `cp/100.0`).
 3. Exportar con el script de arriba a un nuevo `pesos_vN.bin`.
-4. Cargar en el motor Rust: `setoption name NNPath value nn_weights/pesos_vN.bin`
-   seguido de `setoption name UseNN value true`.
+4. Cargar en el motor Rust: `setoption name NNUEPath value nn_weights/pesos_vN.bin`
+   seguido de `setoption name UseNNUE value true`. `NNPath` y `UseNN` se
+   conservan como aliases de compatibilidad.
 
 ## Encoding de entrada (770 floats)
 
@@ -41,35 +42,15 @@ con `neural.rs::vector_entrada`:
 - 768: 1.0 si mueven las blancas, 0.0 si mueven las negras.
 - 769: 1.0 si el bando que mueve conserva algún derecho de enroque.
 
-## Estado de rendimiento (medido, v13.1)
+## Implementacion NNUE
 
-Primera versión (recompute denso de las 770 entradas en cada llamada):
-~10,000-12,000 nodos/seg con `UseNN` activado, más de 100x más lento que
-sin la red (~2,000,000 nodos/seg) -- impracticable para juego real.
+La primera capa ahora se guarda como un acumulador NNUE. En la raiz se
+calcula `bias + features activas`; cada hijo suma o resta solamente las
+features de piezas, turno y enroque que cambiaron. El estado acompana a
+`negamax` y `quiescence`, por lo que cubre capturas, promociones, en passant,
+enroque y null move sin reconstruir las 770 entradas.
 
-**Optimización aplicada (v13.1)**: la entrada de la red es un one-hot
-disperso -- de las 770 entradas, solo ~32-34 valen 1.0 (una por pieza en
-el tablero, más los bits de turno/enroque), el resto son ceros que no
-aportan nada. En vez de recorrer las 770 entradas, el forward pass ahora
-parte de los sesgos y SUMA solo la columna de pesos de cada entrada
-activa (matemáticamente idéntico al cálculo denso -- verificado
-comparando el score exacto en cada profundidad antes/después, coinciden
-bit a bit). Además, la matriz de la primera capa se guarda transpuesta
-(columna-mayor) para que cada suma sea un acceso contiguo a memoria, y
-el forward pass no reserva memoria dinámica por llamada (arreglos de
-tamaño fijo en la pila, no `Vec`).
-
-**Resultado medido**: ~290,000-330,000 nodos/seg con `UseNN` activado --
-de >100x más lento a **~6-7x más lento** que sin la red. Sigue siendo un
-costo real (algo así como 1.5-2 plies menos de profundidad efectiva en
-el mismo tiempo), pero ya es un trade-off razonable a evaluar, no algo
-impracticable. Sin `UseNN` activado, el costo sigue siendo CERO (medido:
-~2,000,000-2,400,000 nodos/seg, idéntico a sin la red).
-
-**Nota**: esto sigue sin ser NNUE real -- un accumulator incremental de
-verdad (actualizar solo el efecto de la pieza que se movió jugada a
-jugada, sin recalcular ni siquiera las ~32 entradas activas desde cero
-en cada nodo) daría otra mejora sustancial encima de esta, pero requiere
-tocar la recursión de `negamax` en `search.rs` para llevar el estado del
-accumulator ply por ply -- un cambio de mayor riesgo/alcance que se dejó
-fuera de esta pasada a propósito, dado lo sensible que es esa función.
+El formato de pesos sigue siendo personalizado y no es compatible con los
+archivos `.nnue` de Stockfish. Para una mejora de fuerza importante, conviene
+reentrenar estos pesos con mas posiciones y comparar ELO con `UseNNUE`
+activada frente a la evaluacion clasica.

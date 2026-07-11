@@ -328,7 +328,10 @@ fn calcular_ataque_rey(b: &Board, factor_ataque: f64) -> AtaqueRey {
     AtaqueRey { ataque_w: puntaje(1, Color::White), ataque_b: puntaje(0, Color::Black) }
 }
 
-pub fn evaluate(b: &Board) -> i32 {
+/// Evalua una posicion usando el acumulador NNUE ya construido por la
+/// busqueda. Mantenerlo fuera de Board evita copiar 1 KiB de estado neuronal
+/// con cada posicion y permite que la recursion lo actualice por jugada.
+pub fn evaluate_with_nnue(b: &Board, nnue: Option<&crate::neural::NnueAccumulator>) -> i32 {
     let pers = personalidad_actual();
     let es_universal = pers == Personalidad::Universal;
     let escala_material = if es_universal { ESCALA_MATERIAL_UNIVERSAL } else { ESCALA_MATERIAL_TAL };
@@ -565,16 +568,13 @@ pub fn evaluate(b: &Board) -> i32 {
     let perspectiva = if b.turn == Color::White { total_i } else { -total_i };
     let clasica = perspectiva + TEMPO;
 
-    // v13: correccion opcional de una red neuronal ligera (ver neural.rs),
-    // APAGADA por defecto (UCI "UseNN"). Aditiva, no reemplaza la
-    // evaluacion clasica -- eval_final = eval_clasica + peso_red*eval_red,
-    // con peso_red chico a proposito: la red es una correccion, no un
-    // reemplazo de algo ya probado en cientos de partidas. Si no esta
-    // activada o no hay pesos cargados, eval_red() devuelve None y esto
-    // es exactamente lo mismo que antes (cero costo, cero cambio).
+    // La salida NNUE se calcula desde el acumulador incremental que acompana
+    // a la linea de busqueda. Sigue siendo una correccion conservadora de la
+    // evaluacion clasica hasta contar con pesos entrenados especificamente
+    // para reemplazarla por completo.
     const PESO_RED: f64 = 0.2;
-    match crate::neural::eval_red(b) {
-        Some(red_cp) => clasica + (PESO_RED * red_cp as f64).round() as i32,
+    match nnue {
+        Some(acumulador) => clasica + (PESO_RED * acumulador.evaluar() as f64).round() as i32,
         None => clasica,
     }
 }

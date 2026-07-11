@@ -344,6 +344,61 @@ fn run_cxb4_bug() {
     println!("{}", if uci == "c3b4" { "eligio cxb4 (igual que v3 sin proteccion)" } else { "NO eligio cxb4" });
 }
 
+fn run_quiescence_check_tests() {
+    // 3 casos pedidos explicitamente para verificar el manejo de jaque
+    // dentro de quiescence (v13, ver bug encontrado por ChatGPT/GPT):
+    //  1. Jaque con UNA sola evasion posible y silenciosa (sin captura) --
+    //     confirma que se generan TODAS las evasiones legales, no solo
+    //     capturas/promociones como en el resto de quiescence.
+    //  2. Mate inmediato (jaque sin ninguna evasion legal) -- confirma que
+    //     devuelve un score de mate real, no un valor heuristico.
+    //  3. Posicion con MUCHO material a favor del lado en jaque (stand_pat
+    //     seria altísimo si se lo dejara "plantarse"), pero es mate de
+    //     todas formas -- confirma que no se usa stand_pat como piso
+    //     cuando hay jaque, sin importar cuan buena se vea la posicion.
+    let casos: Vec<(&str, &str, i32, &str)> = vec![
+        (
+            "jaque con una sola evasion silenciosa",
+            "7r/8/8/8/8/6k1/8/7K w - - 0 1",
+            0, // no es mate, solo confirmamos que NO da mate y que evalua la posicion real
+            "no_mate",
+        ),
+        (
+            "mate inmediato en jaque (sin evasion)",
+            "k7/8/8/8/8/8/5PPP/r6K w - - 0 1",
+            0,
+            "mate",
+        ),
+        (
+            "mate pese a ventaja material enorme (nunca usar stand_pat en jaque)",
+            "7k/8/8/8/QQQ5/8/5nPP/6RK w - - 0 1",
+            0,
+            "mate",
+        ),
+    ];
+    let mut todo_ok = true;
+    for (nombre, fen, _, esperado) in &casos {
+        let b = Board::from_fen(fen).unwrap();
+        let mut s = Searcher::new(16);
+        let sc = s.quiescence_test(&b);
+        let es_mate = sc.abs() >= search::MATE - 1000;
+        let ok = match *esperado {
+            "mate" => es_mate && sc < 0, // mate en contra del lado que mueve (esta siendo matado)
+            "no_mate" => !es_mate,
+            _ => false,
+        };
+        todo_ok &= ok;
+        println!(
+            "{} {} -> score={} {}",
+            if ok { "OK  " } else { "FAIL" },
+            nombre,
+            sc,
+            if es_mate { "(mate detectado)" } else { "(no es mate)" }
+        );
+    }
+    println!("{}", if todo_ok { "TODOS LOS CASOS DE QUIESCENCE-EN-JAQUE OK" } else { "HAY FALLOS EN QUIESCENCE-EN-JAQUE" });
+}
+
 fn run_repetition_tests() {
     // Metodologia: buscar SIN contexto de repeticion para obtener la jugada
     // "natural" y la posicion que resulta de jugarla; despues sembrar
@@ -503,6 +558,31 @@ fn detener_y_recuperar(activa: &mut Option<BusquedaActiva>, searcher_slot: &mut 
     }
 }
 
+/// UCI permite espacios tanto en el nombre como en el valor de una opcion.
+/// En particular, BookPath, NNPath y SyzygyPath deben poder apuntar a rutas
+/// normales de macOS que contengan espacios.
+fn parse_setoption(partes: &[&str]) -> Option<(String, Option<String>)> {
+    let inicio_nombre = partes.iter().position(|&p| p == "name")? + 1;
+    if inicio_nombre >= partes.len() {
+        return None;
+    }
+    let inicio_valor = partes
+        .iter()
+        .enumerate()
+        .skip(inicio_nombre)
+        .find_map(|(i, &p)| (p == "value").then_some(i));
+    let fin_nombre = inicio_valor.unwrap_or(partes.len());
+    let nombre = partes[inicio_nombre..fin_nombre].join(" ");
+    if nombre.is_empty() {
+        return None;
+    }
+    let valor = inicio_valor.and_then(|i| {
+        let valor = partes[i + 1..].join(" ");
+        (!valor.is_empty()).then_some(valor)
+    });
+    Some((nombre, valor))
+}
+
 fn uci_loop() {
     let stdin = io::stdin();
     let mut board = Board::from_fen(STARTPOS).unwrap();
@@ -515,10 +595,10 @@ fn uci_loop() {
     // "Threads" tambien es una opcion UCI real (ver abajo) que sobreescribe
     // este valor inicial.
     let mut n_hilos: usize = std::env::var("MIMOTOR_HILOS").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
-    if let Ok(p) = std::env::var("MIMOTOR_PERSONALIDAD") {
-        if let Some(pers) = eval::personalidad_desde_texto(&p) {
-            eval::set_personalidad(pers);
-        }
+    if let Ok(p) = std::env::var("MIMOTOR_PERSONALIDAD")
+        && let Some(pers) = eval::personalidad_desde_texto(&p)
+    {
+        eval::set_personalidad(pers);
     }
     if let Ok(path) = std::env::var("MIMOTOR_SYZYGY_PATH") {
         match syzygy::init(&path) {
@@ -575,16 +655,16 @@ fn uci_loop() {
                 println!("option name SyzygyPath type string default <empty>");
                 println!("option name BookPath type string default <empty>");
                 println!("option name OwnBook type check default true");
+                println!("option name UseNNUE type check default false");
+                println!("option name NNUEPath type string default <empty>");
                 println!("option name UseNN type check default false");
                 println!("option name NNPath type string default <empty>");
                 println!("uciok");
                 io::stdout().flush().ok();
             }
             "setoption" => {
-                if let Some(ni) = partes.iter().position(|&p| p == "name") {
-                    let nombre = partes.get(ni + 1).copied().unwrap_or("");
-                    let vi = partes.iter().position(|&p| p == "value");
-                    let valor = vi.and_then(|j| partes.get(j + 1)).copied();
+                if let Some((nombre, valor)) = parse_setoption(&partes) {
+                    let valor = valor.as_deref();
                     if nombre.eq_ignore_ascii_case("personalidad") {
                         if let Some(valor) = valor {
                             if let Some(pers) = eval::personalidad_desde_texto(valor) {
@@ -623,18 +703,16 @@ fn uci_loop() {
                         if let Some(v) = valor {
                             polyglot::set_activo(v.eq_ignore_ascii_case("true"));
                         }
-                    } else if nombre.eq_ignore_ascii_case("nnpath") {
+                    } else if nombre.eq_ignore_ascii_case("nnuepath") || nombre.eq_ignore_ascii_case("nnpath") {
                         if let Some(path) = valor {
                             if neural::cargar(path) {
-                                println!("info string red neuronal cargada desde {}", path);
+                                println!("info string NNUE cargada desde {}", path);
                             } else {
-                                println!("info string error cargando red neuronal desde {} (revisar ruta/tamano de archivo)", path);
+                                println!("info string error cargando NNUE desde {} (revisar ruta/tamano de archivo)", path);
                             }
                         }
-                    } else if nombre.eq_ignore_ascii_case("usenn") {
-                        if let Some(v) = valor {
-                            neural::set_activa(v.eq_ignore_ascii_case("true"));
-                        }
+                    } else if (nombre.eq_ignore_ascii_case("usennue") || nombre.eq_ignore_ascii_case("usenn")) && let Some(v) = valor {
+                        neural::set_activa(v.eq_ignore_ascii_case("true"));
                     }
                 }
                 io::stdout().flush().ok();
@@ -678,7 +756,7 @@ fn uci_loop() {
                 }
             }
             "go" => {
-                let infinito = partes.iter().any(|&p| p == "infinite");
+                let infinito = partes.contains(&"infinite");
                 if let Some(i) = partes.iter().position(|&p| p == "depth") {
                     let depth: i32 = partes.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(6);
                     let mut s = searcher_slot.take().unwrap();
@@ -784,6 +862,21 @@ fn uci_loop() {
     }
 }
 
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod tests {
+    use super::parse_setoption;
+
+    #[test]
+    fn setoption_conserva_ruta_con_espacios() {
+        let partes = ["setoption", "name", "NNPath", "value", "/Users/Tavito/Mi", "Motor/red.bin"];
+        assert_eq!(
+            parse_setoption(&partes),
+            Some(("NNPath".to_string(), Some("/Users/Tavito/Mi Motor/red.bin".to_string())))
+        );
+    }
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() > 1 {
@@ -821,6 +914,10 @@ fn main() {
             }
             "repetitiontest" => {
                 run_repetition_tests();
+                return;
+            }
+            "quiescheck" => {
+                run_quiescence_check_tests();
                 return;
             }
             "lmrdiag" => {

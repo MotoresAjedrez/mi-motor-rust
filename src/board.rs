@@ -1,6 +1,6 @@
 use crate::bitboard::{
-    bishop_attacks, bit, king_attacks, knight_attacks, pawn_attacks, pop_lsb, popcount,
-    queen_attacks, rook_attacks, Bitboard, EMPTY,
+    bishop_attacks, bit, king_attacks, knight_attacks, pawn_attacks, pop_lsb, rook_attacks,
+    Bitboard, EMPTY,
 };
 use crate::types::{
     file_of, make_square, rank_of, square_from_name, square_name, Color, Move, MoveFlag,
@@ -108,9 +108,16 @@ impl Board {
             let rank = 7 - i as u8; // FEN empieza en la fila 8
             let mut file = 0u8;
             for ch in rank_str.chars() {
-                if let Some(skip) = ch.to_digit(10) {
-                    file += skip as u8;
+                if ch.is_ascii_digit() {
+                    let skip = ch as u8 - b'0';
+                    if !(1..=8).contains(&skip) || file + skip > 8 {
+                        return Err(format!("fila FEN inválida: {}", rank_str));
+                    }
+                    file += skip;
                 } else {
+                    if file >= 8 {
+                        return Err(format!("fila FEN demasiado larga: {}", rank_str));
+                    }
                     let color = if ch.is_uppercase() { Color::White } else { Color::Black };
                     let pt = PieceType::from_char(ch)
                         .ok_or_else(|| format!("carácter de pieza inválido: {}", ch))?;
@@ -118,6 +125,9 @@ impl Board {
                     b.pieces[color as usize][pt as usize] |= bit(sq);
                     file += 1;
                 }
+            }
+            if file != 8 {
+                return Err(format!("fila FEN incompleta: {}", rank_str));
             }
         }
 
@@ -132,30 +142,76 @@ impl Board {
         let mut cr = 0u8;
         if parts[2] != "-" {
             for ch in parts[2].chars() {
-                match ch {
-                    'K' => cr |= CASTLE_WK,
-                    'Q' => cr |= CASTLE_WQ,
-                    'k' => cr |= CASTLE_BK,
-                    'q' => cr |= CASTLE_BQ,
+                let derecho = match ch {
+                    'K' => CASTLE_WK,
+                    'Q' => CASTLE_WQ,
+                    'k' => CASTLE_BK,
+                    'q' => CASTLE_BQ,
                     _ => return Err(format!("derecho de enroque inválido: {}", ch)),
+                };
+                if cr & derecho != 0 {
+                    return Err(format!("derecho de enroque repetido: {}", ch));
                 }
+                cr |= derecho;
             }
         }
         b.castling_rights = cr;
 
         // 4. Al paso
-        b.ep_square = if parts[3] == "-" { None } else { square_from_name(parts[3]) };
+        b.ep_square = if parts[3] == "-" {
+            None
+        } else {
+            let sq = square_from_name(parts[3])
+                .ok_or_else(|| format!("casilla al paso inválida: {}", parts[3]))?;
+            let rank = rank_of(sq);
+            if rank != 2 && rank != 5 {
+                return Err(format!("casilla al paso en rango inválido: {}", parts[3]));
+            }
+            if (b.turn == Color::White && rank != 5) || (b.turn == Color::Black && rank != 2) {
+                return Err(format!("casilla al paso incompatible con el turno: {}", parts[3]));
+            }
+            Some(sq)
+        };
 
         // 5-6. Contadores (opcionales en algunos FEN recortados)
-        b.halfmove_clock = parts.get(4).and_then(|s| s.parse().ok()).unwrap_or(0);
-        b.fullmove_number = parts.get(5).and_then(|s| s.parse().ok()).unwrap_or(1);
+        b.halfmove_clock = match parts.get(4) {
+            Some(value) => value.parse().map_err(|_| format!("reloj de medio movimiento inválido: {}", value))?,
+            None => 0,
+        };
+        b.fullmove_number = match parts.get(5) {
+            Some(value) => value.parse().map_err(|_| format!("número de jugada inválido: {}", value))?,
+            None => 1,
+        };
+        if b.fullmove_number == 0 {
+            return Err("número de jugada debe ser al menos 1".to_string());
+        }
+
+        let tiene = |color, pt, sq| b.pieces[color as usize][pt as usize] & bit(sq) != 0;
+        if !tiene(Color::White, PieceType::King, make_square(4, 0)) && cr & (CASTLE_WK | CASTLE_WQ) != 0 {
+            return Err("enroque blanco sin rey en e1".to_string());
+        }
+        if !tiene(Color::Black, PieceType::King, make_square(4, 7)) && cr & (CASTLE_BK | CASTLE_BQ) != 0 {
+            return Err("enroque negro sin rey en e8".to_string());
+        }
+        if cr & CASTLE_WK != 0 && !tiene(Color::White, PieceType::Rook, make_square(7, 0)) {
+            return Err("enroque blanco corto sin torre en h1".to_string());
+        }
+        if cr & CASTLE_WQ != 0 && !tiene(Color::White, PieceType::Rook, make_square(0, 0)) {
+            return Err("enroque blanco largo sin torre en a1".to_string());
+        }
+        if cr & CASTLE_BK != 0 && !tiene(Color::Black, PieceType::Rook, make_square(7, 7)) {
+            return Err("enroque negro corto sin torre en h8".to_string());
+        }
+        if cr & CASTLE_BQ != 0 && !tiene(Color::Black, PieceType::Rook, make_square(0, 7)) {
+            return Err("enroque negro largo sin torre en a8".to_string());
+        }
 
         b.recompute_derived();
         b.recompute_zobrist();
         Ok(b)
     }
 
-    pub fn to_fen(&self) -> String {
+    pub fn to_fen(self) -> String {
         let mut s = String::new();
         for i in 0..8 {
             let rank = 7 - i;
@@ -383,5 +439,28 @@ impl Board {
         b.turn = b.turn.opposite();
         b.zobrist ^= k.side_to_move;
         b
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Board;
+
+    #[test]
+    fn rechaza_fila_fen_de_mas_de_ocho_casillas() {
+        let fen = "4k3/8/8/8/8/8/8/9 w - - 0 1";
+        assert!(Board::from_fen(fen).is_err());
+    }
+
+    #[test]
+    fn rechaza_enroque_sin_torre() {
+        let fen = "4k3/8/8/8/8/8/8/4K3 w K - 0 1";
+        assert!(Board::from_fen(fen).is_err());
+    }
+
+    #[test]
+    fn rechaza_casilla_al_paso_invalida() {
+        let fen = "4k3/8/8/8/8/8/8/4K3 w - i9 0 1";
+        assert!(Board::from_fen(fen).is_err());
     }
 }

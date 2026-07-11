@@ -29,20 +29,20 @@ impl SplitMix64 {
 fn build_keys() -> ZobristKeys {
     let mut rng = SplitMix64(0x5EED_C0FF_EE15_BAAD);
     let mut piece_square = [[[0u64; 64]; 6]; 2];
-    for c in 0..2 {
-        for p in 0..6 {
-            for s in 0..64 {
-                piece_square[c][p][s] = rng.next();
+    for color in &mut piece_square {
+        for pieza in color {
+            for casilla in pieza {
+                *casilla = rng.next();
             }
         }
     }
     let mut castling = [0u64; 16];
-    for i in 0..16 {
-        castling[i] = rng.next();
+    for derecho in &mut castling {
+        *derecho = rng.next();
     }
     let mut en_passant_file = [0u64; 8];
-    for i in 0..8 {
-        en_passant_file[i] = rng.next();
+    for archivo in &mut en_passant_file {
+        *archivo = rng.next();
     }
     let side_to_move = rng.next();
 

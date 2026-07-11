@@ -130,7 +130,7 @@ impl Move {
     }
 
     /// Notación UCI: e2e4, e7e8q, etc.
-    pub fn to_uci(&self) -> String {
+    pub fn to_uci(self) -> String {
         let mut s = format!("{}{}", square_name(self.from), square_name(self.to));
         if let Some(p) = self.promotion {
             s.push(p.to_char(Color::Black)); // minúscula siempre en UCI

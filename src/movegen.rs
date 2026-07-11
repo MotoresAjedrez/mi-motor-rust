@@ -21,9 +21,9 @@ pub fn generate_pseudo_legal(b: &Board) -> MoveList {
 
     gen_pawn_moves(b, us, enemy, occ, &mut moves);
     gen_piece_moves(b, us, PieceType::Knight, own, occ, &mut moves, |sq, _| knight_attacks(sq));
-    gen_piece_moves(b, us, PieceType::Bishop, own, occ, &mut moves, |sq, occ| bishop_attacks(sq, occ));
-    gen_piece_moves(b, us, PieceType::Rook, own, occ, &mut moves, |sq, occ| rook_attacks(sq, occ));
-    gen_piece_moves(b, us, PieceType::Queen, own, occ, &mut moves, |sq, occ| queen_attacks(sq, occ));
+    gen_piece_moves(b, us, PieceType::Bishop, own, occ, &mut moves, bishop_attacks);
+    gen_piece_moves(b, us, PieceType::Rook, own, occ, &mut moves, rook_attacks);
+    gen_piece_moves(b, us, PieceType::Queen, own, occ, &mut moves, queen_attacks);
     gen_piece_moves(b, us, PieceType::King, own, occ, &mut moves, |sq, _| king_attacks(sq));
     gen_castling(b, us, &mut moves);
 
@@ -90,10 +90,8 @@ fn gen_pawn_moves(b: &Board, us: Color, enemy: Bitboard, occ: Bitboard, moves: &
             let is_promo = rank_of(to) == promo_rank;
             push_pawn_move(moves, from, to, is_promo, MoveFlag::Capture);
         }
-        if let Some(ep) = b.ep_square {
-            if pawn_attacks(us, from) & bit(ep) != 0 {
-                moves.push(Move::new(from, ep, None, MoveFlag::EnPassant));
-            }
+        if let Some(ep) = b.ep_square && pawn_attacks(us, from) & bit(ep) != 0 {
+            moves.push(Move::new(from, ep, None, MoveFlag::EnPassant));
         }
     }
 }
@@ -113,6 +111,8 @@ fn gen_castling(b: &Board, us: Color, moves: &mut MoveList) {
     match us {
         Color::White => {
             if b.castling_rights & CASTLE_WK != 0
+                && b.pieces[Color::White as usize][PieceType::King as usize] & bit(4) != 0
+                && b.pieces[Color::White as usize][PieceType::Rook as usize] & bit(7) != 0
                 && occ & (bit(5) | bit(6)) == EMPTY
                 && !b.is_square_attacked_by(4, Color::Black)
                 && !b.is_square_attacked_by(5, Color::Black)
@@ -121,6 +121,8 @@ fn gen_castling(b: &Board, us: Color, moves: &mut MoveList) {
                 moves.push(Move::new(4, 6, None, MoveFlag::CastleKing));
             }
             if b.castling_rights & CASTLE_WQ != 0
+                && b.pieces[Color::White as usize][PieceType::King as usize] & bit(4) != 0
+                && b.pieces[Color::White as usize][PieceType::Rook as usize] & bit(0) != 0
                 && occ & (bit(1) | bit(2) | bit(3)) == EMPTY
                 && !b.is_square_attacked_by(4, Color::Black)
                 && !b.is_square_attacked_by(3, Color::Black)
@@ -131,6 +133,8 @@ fn gen_castling(b: &Board, us: Color, moves: &mut MoveList) {
         }
         Color::Black => {
             if b.castling_rights & CASTLE_BK != 0
+                && b.pieces[Color::Black as usize][PieceType::King as usize] & bit(60) != 0
+                && b.pieces[Color::Black as usize][PieceType::Rook as usize] & bit(63) != 0
                 && occ & (bit(61) | bit(62)) == EMPTY
                 && !b.is_square_attacked_by(60, Color::White)
                 && !b.is_square_attacked_by(61, Color::White)
@@ -139,6 +143,8 @@ fn gen_castling(b: &Board, us: Color, moves: &mut MoveList) {
                 moves.push(Move::new(60, 62, None, MoveFlag::CastleKing));
             }
             if b.castling_rights & CASTLE_BQ != 0
+                && b.pieces[Color::Black as usize][PieceType::King as usize] & bit(60) != 0
+                && b.pieces[Color::Black as usize][PieceType::Rook as usize] & bit(56) != 0
                 && occ & (bit(57) | bit(58) | bit(59)) == EMPTY
                 && !b.is_square_attacked_by(60, Color::White)
                 && !b.is_square_attacked_by(59, Color::White)
