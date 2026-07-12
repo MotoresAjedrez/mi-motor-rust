@@ -14,6 +14,15 @@ pub const N_ENTRADA: usize = 770;
 const N_OCULTA1: usize = 256;
 const N_OCULTA2: usize = 32;
 
+fn checksum_fnv1a(datos: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for &byte in datos {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
 pub struct RedNeural {
     // Columna j = contribucion de la feature j a las 256 neuronas de la
     // primera capa. Esta disposicion permite actualizar el acumulador con un
@@ -52,6 +61,19 @@ impl RedNeural {
         let b2 = leer_f32_vec(N_OCULTA2, &mut cursor);
         let w3 = leer_f32_vec(N_OCULTA2, &mut cursor);
         let b3 = leer_f32_vec(1, &mut cursor)[0];
+
+        let todos_finitos = w1_fila
+            .iter()
+            .chain(b1.iter())
+            .chain(w2.iter())
+            .chain(b2.iter())
+            .chain(w3.iter())
+            .chain(std::iter::once(&b3))
+            .all(|v| v.is_finite() && v.abs() <= 1.0e6);
+        if !todos_finitos {
+            eprintln!("info string NNUE: pesos invalidos (NaN, infinito o magnitud absurda)");
+            return None;
+        }
 
         let mut w1_col = vec![0.0; N_ENTRADA * N_OCULTA1];
         for fila in 0..N_OCULTA1 {
@@ -173,18 +195,36 @@ fn almacenamiento() -> &'static RwLock<Option<Arc<RedNeural>>> {
     RED.get_or_init(|| RwLock::new(None))
 }
 
-/// Carga o reemplaza los pesos. UCI detiene cualquier busqueda antes de
-/// ejecutar setoption, asi que reemplazar la Arc no invalida acumuladores que
-/// sigan vivos: conservan una referencia a su propia red.
+/// Carga o reemplaza los pesos. Si la ruta o el contenido son invalidos se
+/// conserva la red anterior, evitando que un error de escritura apague una
+/// NNUE que ya estaba funcionando. Devuelve el checksum FNV-1a del archivo.
+///
+/// UCI detiene cualquier busqueda antes de ejecutar setoption, asi que
+/// reemplazar la Arc no invalida acumuladores que sigan vivos: conservan una
+/// referencia a su propia red.
+pub fn cargar_detallado(path: &str) -> Result<u64, String> {
+    let datos = std::fs::read(path).map_err(|e| format!("no se pudo leer: {e}"))?;
+    let checksum = checksum_fnv1a(&datos);
+    let red = RedNeural::cargar_de_bytes(&datos)
+        .ok_or_else(|| "formato o valores de pesos invalidos".to_string())?;
+    *almacenamiento().write().expect("candado NNUE envenenado") = Some(Arc::new(red));
+    Ok(checksum)
+}
+
 pub fn cargar(path: &str) -> bool {
-    let red = std::fs::read(path).ok().and_then(|datos| RedNeural::cargar_de_bytes(&datos));
-    let ok = red.is_some();
-    *almacenamiento().write().expect("candado NNUE envenenado") = red.map(Arc::new);
-    ok
+    cargar_detallado(path).is_ok()
 }
 
 pub fn set_activa(valor: bool) {
     ACTIVA.store(valor, Ordering::Relaxed);
+}
+
+pub fn esta_activa() -> bool {
+    ACTIVA.load(Ordering::Relaxed)
+}
+
+pub fn hay_red_cargada() -> bool {
+    almacenamiento().read().expect("candado NNUE envenenado").is_some()
 }
 
 pub fn crear_acumulador(b: &Board) -> Option<NnueAccumulator> {
@@ -212,5 +252,19 @@ mod tests {
         let recalculado = NnueAccumulator::desde_tablero(red, &tras_e4);
 
         assert!((incremental.evaluar() - recalculado.evaluar()).abs() < 0.01);
+    }
+
+    #[test]
+    fn rechaza_nan_sin_panico() {
+        let mut datos = std::fs::read("nn_weights/pesos_v1.bin").expect("pesos de prueba");
+        datos[0..4].copy_from_slice(&f32::NAN.to_le_bytes());
+        assert!(RedNeural::cargar_de_bytes(&datos).is_none());
+    }
+
+    #[test]
+    fn checksum_es_estable() {
+        let datos = std::fs::read("nn_weights/pesos_v1.bin").expect("pesos de prueba");
+        assert_eq!(checksum_fnv1a(&datos), checksum_fnv1a(&datos));
+        assert_ne!(checksum_fnv1a(&datos), 0);
     }
 }

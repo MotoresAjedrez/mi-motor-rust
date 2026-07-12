@@ -705,10 +705,9 @@ fn uci_loop() {
                         }
                     } else if nombre.eq_ignore_ascii_case("nnuepath") || nombre.eq_ignore_ascii_case("nnpath") {
                         if let Some(path) = valor {
-                            if neural::cargar(path) {
-                                println!("info string NNUE cargada desde {}", path);
-                            } else {
-                                println!("info string error cargando NNUE desde {} (revisar ruta/tamano de archivo)", path);
+                            match neural::cargar_detallado(path) {
+                                Ok(checksum) => println!("info string NNUE cargada desde {} (checksum {:016x})", path, checksum),
+                                Err(e) => println!("info string error cargando NNUE desde {}: {}", path, e),
                             }
                         }
                     } else if (nombre.eq_ignore_ascii_case("usennue") || nombre.eq_ignore_ascii_case("usenn")) && let Some(v) = valor {
