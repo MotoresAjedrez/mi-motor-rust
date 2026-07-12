@@ -93,13 +93,28 @@ impl RedNeural {
     }
 
     fn salida(&self, acumulador: &[f32; N_OCULTA1]) -> f32 {
+        // ReLU UNA vez por neurona (antes se recalculaba max(0.0) dentro
+        // del producto de cada una de las 32 filas de w2: 8192 max en vez
+        // de 256).
+        let mut h1 = [0.0f32; N_OCULTA1];
+        for (v, &a) in h1.iter_mut().zip(acumulador.iter()) {
+            *v = a.max(0.0);
+        }
         let mut h2 = [0.0; N_OCULTA2];
         for (i, fila) in self.w2.chunks_exact(N_OCULTA1).enumerate() {
-            let dot: f32 = fila
-                .iter()
-                .zip(acumulador.iter())
-                .map(|(&peso, &valor)| peso * valor.max(0.0))
-                .sum();
+            // Producto punto en 8 carriles independientes. La suma f32
+            // secuencial (.zip().map().sum()) encadena cada suma con la
+            // anterior y el compilador no puede vectorizarla (f32 no es
+            // asociativo); con 8 acumuladores separados la dependencia se
+            // rompe y LLVM emite NEON. Perfilado con `sample`: esta funcion
+            // era ~80% del tiempo de busqueda con NNUE activada.
+            let mut lanes = [0.0f32; 8];
+            for (wc, vc) in fila.chunks_exact(8).zip(h1.chunks_exact(8)) {
+                for j in 0..8 {
+                    lanes[j] += wc[j] * vc[j];
+                }
+            }
+            let dot: f32 = lanes.iter().sum();
             h2[i] = (self.b2[i] + dot).max(0.0);
         }
         let dot: f32 = self.w3.iter().zip(h2.iter()).map(|(&peso, &valor)| peso * valor).sum();

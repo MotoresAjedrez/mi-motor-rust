@@ -572,7 +572,7 @@ pub fn evaluate_with_nnue(b: &Board, nnue: Option<&crate::neural::NnueAccumulato
     // a la linea de busqueda. Sigue siendo una correccion conservadora de la
     // evaluacion clasica hasta contar con pesos entrenados especificamente
     // para reemplazarla por completo.
-    const PESO_RED: f64 = 0.2;
+    const PESO_RED: f64 = 0.5;
     match nnue {
         Some(acumulador) => clasica + (PESO_RED * acumulador.evaluar() as f64).round() as i32,
         None => clasica,
