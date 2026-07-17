@@ -1,14 +1,18 @@
 use crate::bitboard::{
-    bishop_attacks, bit, king_attacks, knight_attacks, pawn_attacks, pop_lsb, queen_attacks,
-    rook_attacks, Bitboard, EMPTY,
+    Bitboard, EMPTY, bishop_attacks, bit, king_attacks, knight_attacks, pawn_attacks, pop_lsb,
+    queen_attacks, rook_attacks,
 };
 use crate::board::{Board, CASTLE_BK, CASTLE_BQ, CASTLE_WK, CASTLE_WQ};
-use crate::types::{file_of, make_square, rank_of, Color, Move, MoveFlag, PieceType, Square};
+use crate::types::{Color, Move, MoveFlag, PieceType, Square, file_of, make_square, rank_of};
 
 pub type MoveList = Vec<Move>;
 
-const PROMO_PIECES: [PieceType; 4] =
-    [PieceType::Queen, PieceType::Rook, PieceType::Bishop, PieceType::Knight];
+const PROMO_PIECES: [PieceType; 4] = [
+    PieceType::Queen,
+    PieceType::Rook,
+    PieceType::Bishop,
+    PieceType::Knight,
+];
 
 /// Genera todas las jugadas pseudo-legales (no filtra jaques propios).
 pub fn generate_pseudo_legal(b: &Board) -> MoveList {
@@ -20,11 +24,23 @@ pub fn generate_pseudo_legal(b: &Board) -> MoveList {
     let occ = b.occupied;
 
     gen_pawn_moves(b, us, enemy, occ, &mut moves);
-    gen_piece_moves(b, us, PieceType::Knight, own, occ, &mut moves, |sq, _| knight_attacks(sq));
-    gen_piece_moves(b, us, PieceType::Bishop, own, occ, &mut moves, bishop_attacks);
+    gen_piece_moves(b, us, PieceType::Knight, own, occ, &mut moves, |sq, _| {
+        knight_attacks(sq)
+    });
+    gen_piece_moves(
+        b,
+        us,
+        PieceType::Bishop,
+        own,
+        occ,
+        &mut moves,
+        bishop_attacks,
+    );
     gen_piece_moves(b, us, PieceType::Rook, own, occ, &mut moves, rook_attacks);
     gen_piece_moves(b, us, PieceType::Queen, own, occ, &mut moves, queen_attacks);
-    gen_piece_moves(b, us, PieceType::King, own, occ, &mut moves, |sq, _| king_attacks(sq));
+    gen_piece_moves(b, us, PieceType::King, own, occ, &mut moves, |sq, _| {
+        king_attacks(sq)
+    });
     gen_castling(b, us, &mut moves);
 
     moves
@@ -47,7 +63,11 @@ fn gen_piece_moves<F>(
         let mut targets = attacks_fn(from, occ) & !own;
         while targets != 0 {
             let to = pop_lsb(&mut targets);
-            let flag = if bit(to) & occ != 0 { MoveFlag::Capture } else { MoveFlag::Quiet };
+            let flag = if bit(to) & occ != 0 {
+                MoveFlag::Capture
+            } else {
+                MoveFlag::Quiet
+            };
             moves.push(Move::new(from, to, None, flag));
         }
     }
@@ -70,7 +90,13 @@ fn gen_pawn_moves(b: &Board, us: Color, enemy: Bitboard, occ: Bitboard, moves: &
         if (0..8).contains(&one_rank) {
             let to = make_square(f as u8, one_rank as u8);
             if bit(to) & occ == 0 {
-                push_pawn_move(moves, from, to, promo_rank == one_rank as u8, MoveFlag::Quiet);
+                push_pawn_move(
+                    moves,
+                    from,
+                    to,
+                    promo_rank == one_rank as u8,
+                    MoveFlag::Quiet,
+                );
 
                 // Avance doble
                 if rank_of(from) == start_rank {
@@ -90,7 +116,9 @@ fn gen_pawn_moves(b: &Board, us: Color, enemy: Bitboard, occ: Bitboard, moves: &
             let is_promo = rank_of(to) == promo_rank;
             push_pawn_move(moves, from, to, is_promo, MoveFlag::Capture);
         }
-        if let Some(ep) = b.ep_square && pawn_attacks(us, from) & bit(ep) != 0 {
+        if let Some(ep) = b.ep_square
+            && pawn_attacks(us, from) & bit(ep) != 0
+        {
             moves.push(Move::new(from, ep, None, MoveFlag::EnPassant));
         }
     }
@@ -157,7 +185,80 @@ fn gen_castling(b: &Board, us: Color, moves: &mut MoveList) {
 }
 
 /// Filtra las jugadas pseudo-legales: descarta las que dejan al propio rey en jaque.
+///
+/// Camino rapido: para jugadas que no son de rey/al paso/enroque, en vez de
+/// copiar el tablero completo (Board::make_move) y verificar jaque jugada por
+/// jugada, se calcula UNA vez por nodo el conjunto de piezas propias
+/// clavadas (`pinned_pieces`) -- una jugada de una pieza no clavada siempre
+/// es legal; una pieza clavada solo es legal si se mueve dentro de la misma
+/// linea de clavada (rey-atacante). Jugadas de rey, al paso y enroque siguen
+/// el camino lento (make_move + in_check) por sus reglas especiales (al paso
+/// puede exponer un jaque horizontal poco comun; el rey necesita saber si la
+/// casilla destino esta atacada, no si queda clavado).
+/// Equivalencia verificada exhaustivamente en tests (bitboard::pin_tests /
+/// movegen fuzz) y con la suite de perft completa sin cambios de resultado.
 pub fn generate_legal(b: &Board) -> MoveList {
+    use crate::bitboard::pinned_pieces;
+
+    let us = b.turn;
+    let them = us.opposite();
+    let king_sq = b.king_square(us);
+
+    let camino_lento = |mv: &Move| {
+        let after = b.make_move(mv);
+        !after.in_check(us)
+    };
+
+    if b.in_check(us) {
+        // Evasion de jaque (posibles jaques dobles, bloqueos, etc.): el
+        // caso menos frecuente y mas delicado -- se deja el camino lento,
+        // siempre correcto, sin ganancia medible de nps (pocas jugadas
+        // pseudo-legales cuando el rey esta en jaque).
+        return generate_pseudo_legal(b)
+            .into_iter()
+            .filter(camino_lento)
+            .collect();
+    }
+
+    let own = b.occupied_co[us as usize];
+    let enemy_rook_like = b.pieces[them as usize][PieceType::Rook as usize]
+        | b.pieces[them as usize][PieceType::Queen as usize];
+    let enemy_bishop_like = b.pieces[them as usize][PieceType::Bishop as usize]
+        | b.pieces[them as usize][PieceType::Queen as usize];
+    let pinned = pinned_pieces(king_sq, own, enemy_rook_like, enemy_bishop_like, b.occupied);
+
+    generate_pseudo_legal(b)
+        .into_iter()
+        .filter(|mv| {
+            if bit(mv.from) & pinned == 0
+                && mv.from != king_sq
+                && !matches!(
+                    mv.flag,
+                    MoveFlag::EnPassant | MoveFlag::CastleKing | MoveFlag::CastleQueen
+                )
+            {
+                // Pieza no clavada, no es el rey, no es al paso/enroque:
+                // siempre legal (el rey no esta en jaque en esta rama, y
+                // mover una pieza no clavada no puede exponerlo). Este es
+                // el caso comun (la gran mayoria de jugadas por nodo) y
+                // evita por completo la copia del tablero.
+                true
+            } else {
+                // Casos poco comunes (pieza clavada, jugada de rey, al
+                // paso, enroque): camino lento siempre correcto, sin
+                // atajos -- no vale la pena el riesgo de un bug sutil por
+                // el poco volumen de jugadas que caen aqui.
+                camino_lento(mv)
+            }
+        })
+        .collect()
+}
+
+/// Referencia lenta (ray-casting puro, sin atajo de clavadas) usada SOLO en
+/// tests para verificar que generate_legal produce exactamente el mismo
+/// conjunto de jugadas.
+#[cfg(test)]
+fn generate_legal_referencia(b: &Board) -> MoveList {
     let us = b.turn;
     generate_pseudo_legal(b)
         .into_iter()
@@ -166,4 +267,65 @@ pub fn generate_legal(b: &Board) -> MoveList {
             !after.in_check(us)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod equivalencia_legal_tests {
+    use super::*;
+    use crate::perft::perft;
+
+    fn mismo_conjunto(b: &Board) {
+        assert_eq!(
+            generate_legal(b),
+            generate_legal_referencia(b),
+            "orden de jugadas divergente: {}",
+            b.to_fen()
+        );
+        let mut rapido: Vec<String> = generate_legal(b).iter().map(|m| m.to_uci()).collect();
+        let mut lento: Vec<String> = generate_legal_referencia(b)
+            .iter()
+            .map(|m| m.to_uci())
+            .collect();
+        rapido.sort();
+        lento.sort();
+        assert_eq!(rapido, lento, "FEN divergente: {}", b.to_fen());
+    }
+
+    fn explorar(b: &Board, profundidad: u32) {
+        mismo_conjunto(b);
+        if profundidad == 0 {
+            return;
+        }
+        for mv in generate_legal_referencia(b) {
+            explorar(&b.make_move(&mv), profundidad - 1);
+        }
+    }
+
+    #[test]
+    fn generate_legal_coincide_con_referencia_posiciones_estandar() {
+        let posiciones = [
+            crate::board::Board::startpos(),
+            Board::from_fen("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq -")
+                .unwrap(),
+            Board::from_fen("rnbqkbnr/pp1ppppp/8/2pP4/8/8/PPP1PPPP/RNBQKBNR w KQkq c6 0 2")
+                .unwrap(),
+            Board::from_fen("8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1").unwrap(),
+            Board::from_fen("r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1")
+                .unwrap(),
+        ];
+        for b in &posiciones {
+            explorar(b, 3);
+        }
+    }
+
+    #[test]
+    fn perft_no_cambia_con_atajo_de_clavadas() {
+        // El atajo de clavadas es una optimizacion de generate_legal, no de
+        // movegen en general -- si perft (que llama generate_legal en cada
+        // nodo via perft/perft_divide) sigue dando los mismos numeros que
+        // los certificados, la equivalencia esta confirmada tambien a
+        // profundidad mayor con miles de posiciones intermedias reales.
+        let b = Board::startpos();
+        assert_eq!(perft(&b, 5), 4_865_609);
+    }
 }

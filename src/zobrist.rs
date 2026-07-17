@@ -46,7 +46,12 @@ fn build_keys() -> ZobristKeys {
     }
     let side_to_move = rng.next();
 
-    ZobristKeys { piece_square, castling, en_passant_file, side_to_move }
+    ZobristKeys {
+        piece_square,
+        castling,
+        en_passant_file,
+        side_to_move,
+    }
 }
 
 pub fn keys() -> &'static ZobristKeys {

@@ -16,8 +16,8 @@ use board::Board;
 use search::Searcher;
 use std::env;
 use std::io::{self, BufRead, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use types::{Move, MoveFlag, PieceType};
 
@@ -42,20 +42,46 @@ fn run_simple(fen: &str, movetime_ms: u64) {
     let pv = s.extraer_pv(&b, 12);
     let pv_txt = pv.iter().map(|m| m.to_uci()).collect::<Vec<_>>().join(" ");
     println!("================ MiMotor Tal ================");
-    println!("Mejor jugada: {}", mv.map(|m| m.to_uci()).unwrap_or_else(|| "0000".to_string()));
+    println!(
+        "Mejor jugada: {}",
+        mv.map(|m| m.to_uci()).unwrap_or_else(|| "0000".to_string())
+    );
     println!("Evaluacion: {:+.2}", sc as f64 / 100.0);
     println!("Profundidad: {}", prof);
     println!("Nodos: {}", s.nodes);
-    println!("Linea principal: {}", if pv_txt.is_empty() { "(no disponible)" } else { &pv_txt });
+    println!(
+        "Linea principal: {}",
+        if pv_txt.is_empty() {
+            "(no disponible)"
+        } else {
+            &pv_txt
+        }
+    );
     println!("===============================================");
 }
 
 fn run_perft_suite() {
     let cases: Vec<(&str, &str, Vec<u64>)> = vec![
-        ("posicion inicial", STARTPOS, vec![1, 20, 400, 8902, 197281, 4865609, 119060324]),
-        ("kiwipete", KIWIPETE, vec![1, 48, 2039, 97862, 4085603, 193690690]),
-        ("posicion 3", POSITION3, vec![1, 14, 191, 2812, 43238, 674624, 11030083]),
-        ("posicion 5", POSITION5, vec![1, 44, 1486, 62379, 2103487, 89941194]),
+        (
+            "posicion inicial",
+            STARTPOS,
+            vec![1, 20, 400, 8902, 197281, 4865609, 119060324],
+        ),
+        (
+            "kiwipete",
+            KIWIPETE,
+            vec![1, 48, 2039, 97862, 4085603, 193690690],
+        ),
+        (
+            "posicion 3",
+            POSITION3,
+            vec![1, 14, 191, 2812, 43238, 674624, 11030083],
+        ),
+        (
+            "posicion 5",
+            POSITION5,
+            vec![1, 44, 1486, 62379, 2103487, 89941194],
+        ),
     ];
 
     let mut todo_ok = true;
@@ -68,19 +94,33 @@ fn run_perft_suite() {
             let dt = t0.elapsed();
             let ok = n == esperado;
             todo_ok &= ok;
-            let nps = if dt.as_secs_f64() > 0.0 { n as f64 / dt.as_secs_f64() } else { 0.0 };
+            let nps = if dt.as_secs_f64() > 0.0 {
+                n as f64 / dt.as_secs_f64()
+            } else {
+                0.0
+            };
             println!(
                 "  depth {}: {} (esperado {}) {}  [{:.2}s, {:.0} nps]",
-                depth, n, esperado,
+                depth,
+                n,
+                esperado,
                 if ok { "OK" } else { "*** FALLO ***" },
-                dt.as_secs_f64(), nps
+                dt.as_secs_f64(),
+                nps
             );
             if !ok {
                 break;
             }
         }
     }
-    println!("\n{}", if todo_ok { "TODOS LOS PERFT OK" } else { "HAY FALLOS DE PERFT -- NO AVANZAR A FASE 3" });
+    println!(
+        "\n{}",
+        if todo_ok {
+            "TODOS LOS PERFT OK"
+        } else {
+            "HAY FALLOS DE PERFT -- NO AVANZAR A FASE 3"
+        }
+    );
 }
 
 fn run_divide(fen: &str, depth: u32) {
@@ -96,19 +136,38 @@ fn run_divide(fen: &str, depth: u32) {
 fn run_smp_bench(movetime_ms: u64) {
     let fen = "r1bqk2r/ppp2ppp/2n2n2/2bpp3/2B1P3/2NP1N2/PPP2PPP/R1BQK2R w KQkq - 0 6";
     let b = Board::from_fen(fen).unwrap();
-    println!("Benchmark Lazy SMP -- posicion de medio juego, {}ms por hilo/config", movetime_ms);
+    println!(
+        "Benchmark Lazy SMP -- posicion de medio juego, {}ms por hilo/config",
+        movetime_ms
+    );
     for n in [1usize, 2, 4, 6, 8] {
         let (tt, tt_mask) = search::construir_tt(64);
         let t0 = Instant::now();
         let (mv, sc, nodos, resultados) = search::buscar_lazy_smp(
-            &b, Some(movetime_ms), 64, n, &tt, tt_mask, false, &[], Arc::new(AtomicBool::new(false)),
+            &b,
+            Some(movetime_ms),
+            64,
+            n,
+            &tt,
+            tt_mask,
+            true,
+            true,
+            0,
+            &[],
+            Arc::new(AtomicBool::new(false)),
         );
         let dt = t0.elapsed();
         let nps = nodos as f64 / dt.as_secs_f64().max(0.0001);
         let profs: Vec<i32> = resultados.iter().map(|r| r.profundidad).collect();
         println!(
             "  {} hilo(s): jugada={} score={} | {} nodos TOTALES en {:.2}s = {:.0} nps combinados | profundidades por hilo: {:?}",
-            n, mv.map(|m| m.to_uci()).unwrap_or_default(), sc, nodos, dt.as_secs_f64(), nps, profs
+            n,
+            mv.map(|m| m.to_uci()).unwrap_or_default(),
+            sc,
+            nodos,
+            dt.as_secs_f64(),
+            nps,
+            profs
         );
     }
 }
@@ -116,7 +175,10 @@ fn run_smp_bench(movetime_ms: u64) {
 fn run_bench(depth: i32) {
     let posiciones = [
         ("inicial", STARTPOS),
-        ("medio juego", "r1bqk2r/ppp2ppp/2n2n2/2bpp3/2B1P3/2NP1N2/PPP2PPP/R1BQK2R w KQkq - 0 6"),
+        (
+            "medio juego",
+            "r1bqk2r/ppp2ppp/2n2n2/2bpp3/2B1P3/2NP1N2/PPP2PPP/R1BQK2R w KQkq - 0 6",
+        ),
     ];
     for (nombre, fen) in posiciones {
         let b = Board::from_fen(fen).unwrap();
@@ -127,12 +189,20 @@ fn run_bench(depth: i32) {
         let nps = nodes as f64 / dt.as_secs_f64().max(0.0001);
         println!(
             "{}: profundidad {} -> {} (score {}) | {} nodos en {:.2}s = {:.0} nps",
-            nombre, depth, mv.map(|m| m.to_uci()).unwrap_or_default(), sc, nodes, dt.as_secs_f64(), nps
+            nombre,
+            depth,
+            mv.map(|m| m.to_uci()).unwrap_or_default(),
+            sc,
+            nodes,
+            dt.as_secs_f64(),
+            nps
         );
         if s.lmr_intentos > 0 {
             println!(
                 "  LMR: {} intentos, {} re-busquedas a profundidad completa ({:.1}%)",
-                s.lmr_intentos, s.lmr_reintentos, 100.0 * s.lmr_reintentos as f64 / s.lmr_intentos as f64
+                s.lmr_intentos,
+                s.lmr_reintentos,
+                100.0 * s.lmr_reintentos as f64 / s.lmr_intentos as f64
             );
         }
     }
@@ -148,12 +218,27 @@ fn run_lmr_diagnostico(depth: i32) {
     // efectiva, no un bug de logica.
     let posiciones = [
         ("inicial", STARTPOS),
-        ("medio juego", "r1bqk2r/ppp2ppp/2n2n2/2bpp3/2B1P3/2NP1N2/PPP2PPP/R1BQK2R w KQkq - 0 6"),
-        ("tactica capturas", "r2q1rk1/pp1nbppp/2p1pn2/3p4/2PP4/1PN1PN2/PB3PPP/R2Q1RK1 w - - 0 10"),
-        ("bug cxb4", "r1b1k2r/ppqp1ppp/4p3/4n3/1b6/2PQBN2/P1P2PPP/R3KB1R w KQkq - 0 11"),
-        ("mate pastor", "r1bqkb1r/pppp1ppp/2n2n2/4p2Q/2B1P3/8/PPPP1PPP/RNB1K1NR w KQkq - 4 4"),
+        (
+            "medio juego",
+            "r1bqk2r/ppp2ppp/2n2n2/2bpp3/2B1P3/2NP1N2/PPP2PPP/R1BQK2R w KQkq - 0 6",
+        ),
+        (
+            "tactica capturas",
+            "r2q1rk1/pp1nbppp/2p1pn2/3p4/2PP4/1PN1PN2/PB3PPP/R2Q1RK1 w - - 0 10",
+        ),
+        (
+            "bug cxb4",
+            "r1b1k2r/ppqp1ppp/4p3/4n3/1b6/2PQBN2/P1P2PPP/R3KB1R w KQkq - 0 11",
+        ),
+        (
+            "mate pastor",
+            "r1bqkb1r/pppp1ppp/2n2n2/4p2Q/2B1P3/8/PPPP1PPP/RNB1K1NR w KQkq - 4 4",
+        ),
         ("final torres", "8/5pk1/6p1/8/8/1R6/5PPP/6K1 w - - 0 1"),
-        ("kiwipete-ish", "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1"),
+        (
+            "kiwipete-ish",
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        ),
     ];
     let mut peor_encontrado = false;
     for (nombre, fen) in posiciones {
@@ -172,17 +257,28 @@ fn run_lmr_diagnostico(depth: i32) {
         println!(
             "{:20} sin-LMR: {} (score {})   con-LMR: {} (score {})   diff={:+}  {}",
             nombre,
-            mv_sin.map(|m| m.to_uci()).unwrap_or_default(), sc_sin,
-            mv_con.map(|m| m.to_uci()).unwrap_or_default(), sc_con,
+            mv_sin.map(|m| m.to_uci()).unwrap_or_default(),
+            sc_sin,
+            mv_con.map(|m| m.to_uci()).unwrap_or_default(),
+            sc_con,
             diff,
-            if peor { "*** LMR PEOR ***" } else if mv_sin == mv_con { "(misma jugada)" } else { "(distinta jugada, score similar)" }
+            if peor {
+                "*** LMR PEOR ***"
+            } else if mv_sin == mv_con {
+                "(misma jugada)"
+            } else {
+                "(distinta jugada, score similar)"
+            }
         );
     }
-    println!("\n{}", if peor_encontrado {
-        "LMR encontro una jugada claramente peor en al menos una posicion -- revisar mas"
-    } else {
-        "LMR no perdio ninguna tactica en este lote a profundidad fija -- consistente con tradeoff de tiempo, no bug de logica"
-    });
+    println!(
+        "\n{}",
+        if peor_encontrado {
+            "LMR encontro una jugada claramente peor en al menos una posicion -- revisar mas"
+        } else {
+            "LMR no perdio ninguna tactica en este lote a profundidad fija -- consistente con tradeoff de tiempo, no bug de logica"
+        }
+    );
 }
 
 fn run_singular_diagnostico(depth: i32) {
@@ -195,13 +291,31 @@ fn run_singular_diagnostico(depth: i32) {
     // lote es la condicion pedida antes de considerar activar el default.
     let posiciones = [
         ("inicial", STARTPOS),
-        ("medio juego", "r1bqk2r/ppp2ppp/2n2n2/2bpp3/2B1P3/2NP1N2/PPP2PPP/R1BQK2R w KQkq - 0 6"),
-        ("tactica capturas", "r2q1rk1/pp1nbppp/2p1pn2/3p4/2PP4/1PN1PN2/PB3PPP/R2Q1RK1 w - - 0 10"),
-        ("bug cxb4", "r1b1k2r/ppqp1ppp/4p3/4n3/1b6/2PQBN2/P1P2PPP/R3KB1R w KQkq - 0 11"),
-        ("mate pastor", "r1bqkb1r/pppp1ppp/2n2n2/4p2Q/2B1P3/8/PPPP1PPP/RNB1K1NR w KQkq - 4 4"),
+        (
+            "medio juego",
+            "r1bqk2r/ppp2ppp/2n2n2/2bpp3/2B1P3/2NP1N2/PPP2PPP/R1BQK2R w KQkq - 0 6",
+        ),
+        (
+            "tactica capturas",
+            "r2q1rk1/pp1nbppp/2p1pn2/3p4/2PP4/1PN1PN2/PB3PPP/R2Q1RK1 w - - 0 10",
+        ),
+        (
+            "bug cxb4",
+            "r1b1k2r/ppqp1ppp/4p3/4n3/1b6/2PQBN2/P1P2PPP/R3KB1R w KQkq - 0 11",
+        ),
+        (
+            "mate pastor",
+            "r1bqkb1r/pppp1ppp/2n2n2/4p2Q/2B1P3/8/PPPP1PPP/RNB1K1NR w KQkq - 4 4",
+        ),
         ("final torres", "8/5pk1/6p1/8/8/1R6/5PPP/6K1 w - - 0 1"),
-        ("kiwipete-ish", "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1"),
-        ("cacería de rey (partida real v11, jug.31)", "2r3k1/p1bQ1ppp/6b1/6N1/8/5P2/P4P1P/6K1 b - - 1 31"),
+        (
+            "kiwipete-ish",
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        ),
+        (
+            "cacería de rey (partida real v11, jug.31)",
+            "2r3k1/p1bQ1ppp/6b1/6N1/8/5P2/P4P1P/6K1 b - - 1 31",
+        ),
     ];
     let mut peor_encontrado = false;
     let mut nodos_explotaron = false;
@@ -224,25 +338,55 @@ fn run_singular_diagnostico(depth: i32) {
         println!(
             "{:30} sin-SE: {} (score {}, {} nodos)   con-SE: {} (score {}, {} nodos, x{:.1})   diff={:+}  {}{}",
             nombre,
-            mv_sin.map(|m| m.to_uci()).unwrap_or_default(), sc_sin, nodos_sin,
-            mv_con.map(|m| m.to_uci()).unwrap_or_default(), sc_con, nodos_con, ratio_nodos,
+            mv_sin.map(|m| m.to_uci()).unwrap_or_default(),
+            sc_sin,
+            nodos_sin,
+            mv_con.map(|m| m.to_uci()).unwrap_or_default(),
+            sc_con,
+            nodos_con,
+            ratio_nodos,
             diff,
-            if peor { "*** SE PEOR ***" } else if mv_sin == mv_con { "(misma jugada)" } else { "(distinta jugada, score similar)" },
-            if exploto { "  *** EXPLOSION DE NODOS ***" } else { "" }
+            if peor {
+                "*** SE PEOR ***"
+            } else if mv_sin == mv_con {
+                "(misma jugada)"
+            } else {
+                "(distinta jugada, score similar)"
+            },
+            if exploto {
+                "  *** EXPLOSION DE NODOS ***"
+            } else {
+                ""
+            }
         );
     }
-    println!("\n{}", if peor_encontrado || nodos_explotaron {
-        "singular extensions FALLO el diagnostico -- NO activar por defecto (MIMOTOR_SINGULAR=1 sigue disponible solo para pruebas)"
-    } else {
-        "singular extensions paso el diagnostico: sin perdidas de score ni explosion de nodos en este lote"
-    });
+    println!(
+        "\n{}",
+        if peor_encontrado || nodos_explotaron {
+            "singular extensions FALLO el diagnostico -- NO activar por defecto (MIMOTOR_SINGULAR=1 sigue disponible solo para pruebas)"
+        } else {
+            "singular extensions paso el diagnostico: sin perdidas de score ni explosion de nodos en este lote"
+        }
+    );
 }
 
 fn run_mate_tests() {
     let casos = [
-        ("Mate en 1: Ta8# (pasillo)", "6k1/8/6K1/8/8/8/8/R7 w - - 0 1", "a1a8"),
-        ("Mate en 1: Dh4# (mate del loco)", "rnbqkbnr/pppp1ppp/8/4p3/6P1/5P2/PPPPP2P/RNBQKBNR b KQkq - 0 1", "d8h4"),
-        ("Mate en 1: Dxf7# (mate pastor)", "r1bqkb1r/pppp1ppp/2n2n2/4p2Q/2B1P3/8/PPPP1PPP/RNB1K1NR w KQkq - 4 4", "h5f7"),
+        (
+            "Mate en 1: Ta8# (pasillo)",
+            "6k1/8/6K1/8/8/8/8/R7 w - - 0 1",
+            "a1a8",
+        ),
+        (
+            "Mate en 1: Dh4# (mate del loco)",
+            "rnbqkbnr/pppp1ppp/8/4p3/6P1/5P2/PPPPP2P/RNBQKBNR b KQkq - 0 1",
+            "d8h4",
+        ),
+        (
+            "Mate en 1: Dxf7# (mate pastor)",
+            "r1bqkb1r/pppp1ppp/2n2n2/4p2Q/2B1P3/8/PPPP1PPP/RNB1K1NR w KQkq - 4 4",
+            "h5f7",
+        ),
     ];
     let mut todo_ok = true;
     for (nombre, fen, esperada) in casos.iter() {
@@ -254,10 +398,22 @@ fn run_mate_tests() {
         todo_ok &= ok;
         println!(
             "{} {} -> {} (esperada {}) score={} nodos={}",
-            if ok { "OK  " } else { "FAIL" }, nombre, uci, esperada, sc, nodes
+            if ok { "OK  " } else { "FAIL" },
+            nombre,
+            uci,
+            esperada,
+            sc,
+            nodes
         );
     }
-    println!("{}", if todo_ok { "TODOS LOS MATES OK" } else { "HAY FALLOS EN LA SUITE DE MATES" });
+    println!(
+        "{}",
+        if todo_ok {
+            "TODOS LOS MATES OK"
+        } else {
+            "HAY FALLOS EN LA SUITE DE MATES"
+        }
+    );
 }
 
 fn run_prueba_apertura() {
@@ -277,7 +433,13 @@ fn run_prueba_apertura() {
             Some(m) => m,
             None => break,
         };
-        println!("  jugada propia #{}: {} (score {}, {} nodos)", i + 1, mv.to_uci(), sc, nodes);
+        println!(
+            "  jugada propia #{}: {} (score {}, {} nodos)",
+            i + 1,
+            mv.to_uci(),
+            sc,
+            nodes
+        );
         if mv.flag == MoveFlag::CastleKing || mv.flag == MoveFlag::CastleQueen {
             enrocó = true;
         }
@@ -293,7 +455,14 @@ fn run_prueba_apertura() {
             break;
         }
     }
-    println!("{}", if enrocó { "OK: el motor enrocó" } else { "el motor NO enrocó en 10 jugadas" });
+    println!(
+        "{}",
+        if enrocó {
+            "OK: el motor enrocó"
+        } else {
+            "el motor NO enrocó en 10 jugadas"
+        }
+    );
 }
 
 fn aplicar_uci(b: &Board, uci: &str) -> Board {
@@ -304,13 +473,22 @@ fn aplicar_uci(b: &Board, uci: &str) -> Board {
 fn parse_uci_move(b: &Board, uci: &str) -> Option<Move> {
     let moves = movegen::generate_legal(b);
     let bytes = uci.as_bytes();
-    if bytes.len() < 4 {
+    if bytes.len() != 4 && bytes.len() != 5 {
         return None;
     }
     let from = types::square_from_name(&uci[0..2])?;
     let to = types::square_from_name(&uci[2..4])?;
-    let promo = if bytes.len() >= 5 { PieceType::from_char(bytes[4] as char) } else { None };
-    moves.into_iter().find(|m| m.from == from && m.to == to && m.promotion == promo)
+    let promo = if bytes.len() == 5 {
+        PieceType::from_char(bytes[4] as char)
+    } else {
+        None
+    };
+    if bytes.len() == 5 && promo.is_none() {
+        return None;
+    }
+    moves
+        .into_iter()
+        .find(|m| m.from == from && m.to == to && m.promotion == promo)
 }
 
 /// Construye una jugada SIN validar legalidad real de movimiento (solo
@@ -323,7 +501,8 @@ fn parse_uci_move(b: &Board, uci: &str) -> Option<Move> {
 fn jugada_sintetica(b: &Board, uci: &str) -> Move {
     let from = types::square_from_name(&uci[0..2]).unwrap();
     let to = types::square_from_name(&uci[2..4]).unwrap();
-    let es_al_paso = b.piece_at(from).map(|(_, pt)| pt) == Some(PieceType::Pawn) && Some(to) == b.ep_square;
+    let es_al_paso =
+        b.piece_at(from).map(|(_, pt)| pt) == Some(PieceType::Pawn) && Some(to) == b.ep_square;
     let flag = if es_al_paso {
         MoveFlag::EnPassant
     } else if b.piece_at(to).is_some() {
@@ -340,63 +519,83 @@ fn run_cxb4_bug() {
     let mut s = Searcher::new(64);
     let (mv, sc, nodes) = s.search_fixed_depth(&b, 6);
     let uci = mv.map(|m| m.to_uci()).unwrap_or_default();
-    println!("FEN bug cxb4: jugada elegida = {} (score {}, {} nodos)", uci, sc, nodes);
-    println!("{}", if uci == "c3b4" { "eligio cxb4 (igual que v3 sin proteccion)" } else { "NO eligio cxb4" });
+    println!(
+        "FEN bug cxb4: jugada elegida = {} (score {}, {} nodos)",
+        uci, sc, nodes
+    );
+    println!(
+        "{}",
+        if uci == "c3b4" {
+            "eligio cxb4 (igual que v3 sin proteccion)"
+        } else {
+            "NO eligio cxb4"
+        }
+    );
 }
 
-fn run_quiescence_check_tests() {
-    // 3 casos pedidos explicitamente para verificar el manejo de jaque
-    // dentro de quiescence (v13, ver bug encontrado por ChatGPT/GPT):
-    //  1. Jaque con UNA sola evasion posible y silenciosa (sin captura) --
-    //     confirma que se generan TODAS las evasiones legales, no solo
-    //     capturas/promociones como en el resto de quiescence.
-    //  2. Mate inmediato (jaque sin ninguna evasion legal) -- confirma que
-    //     devuelve un score de mate real, no un valor heuristico.
-    //  3. Posicion con MUCHO material a favor del lado en jaque (stand_pat
-    //     seria altísimo si se lo dejara "plantarse"), pero es mate de
-    //     todas formas -- confirma que no se usa stand_pat como piso
-    //     cuando hay jaque, sin importar cuan buena se vea la posicion.
-    let casos: Vec<(&str, &str, i32, &str)> = vec![
-        (
-            "jaque con una sola evasion silenciosa",
-            "7r/8/8/8/8/6k1/8/7K w - - 0 1",
-            0, // no es mate, solo confirmamos que NO da mate y que evalua la posicion real
-            "no_mate",
-        ),
-        (
-            "mate inmediato en jaque (sin evasion)",
-            "k7/8/8/8/8/8/5PPP/r6K w - - 0 1",
-            0,
-            "mate",
-        ),
-        (
-            "mate pese a ventaja material enorme (nunca usar stand_pat en jaque)",
-            "7k/8/8/8/QQQ5/8/5nPP/6RK w - - 0 1",
-            0,
-            "mate",
-        ),
-    ];
+fn run_endgame_tests() {
+    // Finales basicos, resultado teorico conocido sin ambiguedad:
+    //  1. K+D vs K: cualquier jugada razonable debe ser decisiva (score muy
+    //     alto) y NUNCA ahogar al rey rival (blunder clasico de motores
+    //     debiles en este final "trivial").
+    //  2. K+P vs K con la oposicion ya tomada por el bando fuerte: el motor
+    //     debe reconocerlo como claramente ganado (score alto), no como
+    //     tablas -- el caso de libro mas basico de finales de peones.
     let mut todo_ok = true;
-    for (nombre, fen, _, esperado) in &casos {
+
+    {
+        let fen = "8/8/7k/8/3Q4/8/8/K7 w - - 0 1";
         let b = Board::from_fen(fen).unwrap();
         let mut s = Searcher::new(16);
-        let sc = s.quiescence_test(&b);
-        let es_mate = sc.abs() >= search::MATE - 1000;
-        let ok = match *esperado {
-            "mate" => es_mate && sc < 0, // mate en contra del lado que mueve (esta siendo matado)
-            "no_mate" => !es_mate,
-            _ => false,
-        };
+        let (mv, sc, _) = s.search_fixed_depth(&b, 6);
+        let mv = mv.unwrap();
+        let next = b.make_move(&mv);
+        let ahoga = movegen::generate_legal(&next).is_empty() && !next.in_check(next.turn);
+        let ok = !ahoga && sc > 500;
         todo_ok &= ok;
         println!(
-            "{} {} -> score={} {}",
+            "{} K+D vs K: jugada={} score={} {}",
             if ok { "OK  " } else { "FAIL" },
-            nombre,
+            mv.to_uci(),
             sc,
-            if es_mate { "(mate detectado)" } else { "(no es mate)" }
+            if ahoga {
+                "*** AHOGA AL REY RIVAL ***"
+            } else {
+                "(sin ahogar, score decisivo)"
+            }
         );
     }
-    println!("{}", if todo_ok { "TODOS LOS CASOS DE QUIESCENCE-EN-JAQUE OK" } else { "HAY FALLOS EN QUIESCENCE-EN-JAQUE" });
+
+    {
+        // Rey negro demasiado lejos para alcanzar al peon (sin ambiguedad
+        // de oposicion): debe ser claramente ganado con tecnica trivial.
+        let fen = "6k1/8/4K3/4P3/8/8/8/8 w - - 0 1";
+        let b = Board::from_fen(fen).unwrap();
+        let mut s = Searcher::new(16);
+        let (mv, sc, _) = s.search_fixed_depth(&b, 8);
+        let ok = sc > 400; // claramente ganado, no "tablas" ni "un poco mejor"
+        todo_ok &= ok;
+        println!(
+            "{} K+P vs K (rey rival fuera de alcance): jugada={} score={} {}",
+            if ok { "OK  " } else { "FAIL" },
+            mv.map(|m| m.to_uci()).unwrap_or_default(),
+            sc,
+            if ok {
+                "(reconocido como ganado)"
+            } else {
+                "*** NO lo ve claramente ganado ***"
+            }
+        );
+    }
+
+    println!(
+        "{}",
+        if todo_ok {
+            "TODOS LOS CASOS DE FINALES OK"
+        } else {
+            "HAY FALLOS EN LOS CASOS DE FINALES"
+        }
+    );
 }
 
 fn run_repetition_tests() {
@@ -425,13 +624,24 @@ fn run_repetition_tests() {
     s2.set_game_history(vec![p2.zobrist]);
     let (mv2, sc2, _) = s2.search_fixed_depth(&ba, 6);
     let mv2 = mv2.expect("deberia haber jugada legal");
-    println!("  con esa posicion ya \"vista\": jugada={} score={}", mv2.to_uci(), sc2);
+    println!(
+        "  con esa posicion ya \"vista\": jugada={} score={}",
+        mv2.to_uci(),
+        sc2
+    );
     // Debe seguir siendo claramente ganador (no cerca de 0) -- si eligio la
     // MISMA jugada que antes, su resultado NO debe coincidir con p2 (busco
     // otra continuacion), o el score debe seguir siendo muy alto.
     let evito = mv2 != mv1 || sc2.abs() > 500;
     ok &= evito;
-    println!("  {}", if evito { "OK: sigue jugando para ganar, no repite a lo tonto" } else { "FALLO: parece haber aceptado repetir estando ganando" });
+    println!(
+        "  {}",
+        if evito {
+            "OK: sigue jugando para ganar, no repite a lo tonto"
+        } else {
+            "FALLO: parece haber aceptado repetir estando ganando"
+        }
+    );
 
     println!("\n=== Test B: PERDIENDO (K vs K+D+T), debe BUSCAR repetir ===");
     let fen_b = "8/8/4k3/8/8/4K3/8/3qr3 w - - 10 6";
@@ -440,13 +650,21 @@ fn run_repetition_tests() {
     let (mv3, sc3, _) = s3.search_fixed_depth(&bb, 6);
     let mv3 = mv3.expect("deberia haber jugada legal");
     let p2b = bb.make_move(&mv3);
-    println!("  sin historial: jugada={} score={} (posicion perdida de verdad)", mv3.to_uci(), sc3);
+    println!(
+        "  sin historial: jugada={} score={} (posicion perdida de verdad)",
+        mv3.to_uci(),
+        sc3
+    );
 
     let mut s4 = Searcher::new(16);
     s4.set_game_history(vec![p2b.zobrist]);
     let (mv4, sc4, _) = s4.search_fixed_depth(&bb, 6);
     let mv4 = mv4.expect("deberia haber jugada legal");
-    println!("  con esa posicion ya \"vista\": jugada={} score={}", mv4.to_uci(), sc4);
+    println!(
+        "  con esa posicion ya \"vista\": jugada={} score={}",
+        mv4.to_uci(),
+        sc4
+    );
     // Ahora debe preferir la tabla en vez de seguir perdiendo (sc3, que
     // deberia ser muy negativo o mate en contra). El "contempt" dinamico
     // (agregado en esta misma sesion) puntua la repeticion a +/-200 cuando
@@ -454,21 +672,70 @@ fn run_repetition_tests() {
     // margen es <= 200 (no < 200): el valor esperado de verdad es 200.
     let busca_tablas = sc4 > sc3 + 200 && sc4.abs() <= 200;
     ok &= busca_tablas;
-    println!("  {}", if busca_tablas { "OK: prefiere la repeticion (tablas) en vez de seguir perdiendo" } else { "FALLO: no aprovecho la repeticion disponible" });
+    println!(
+        "  {}",
+        if busca_tablas {
+            "OK: prefiere la repeticion (tablas) en vez de seguir perdiendo"
+        } else {
+            "FALLO: no aprovecho la repeticion disponible"
+        }
+    );
 
-    println!("\n{}", if ok { "TODOS LOS TESTS DE REPETICION OK" } else { "HAY FALLOS EN LA DETECCION DE REPETICION" });
+    println!(
+        "\n{}",
+        if ok {
+            "TODOS LOS TESTS DE REPETICION OK"
+        } else {
+            "HAY FALLOS EN LA DETECCION DE REPETICION"
+        }
+    );
 }
 
 fn run_see_tests() {
     let mut ok = true;
     let casos: Vec<(&str, &str, &str, i32)> = vec![
-        ("Caso 1 (captura libre)", "k7/8/8/7p/8/8/8/K6R w - - 0 1", "h1h5", 100),
-        ("Caso 2 (1v1, mal cambio)", "k2r4/8/8/3p4/8/8/8/K2R4 w - - 0 1", "d1d5", 100 - 500),
-        ("Caso 3 (2 atacantes vs 1 defensor)", "k2r4/8/8/3p4/8/8/3R4/K2R4 w - - 0 1", "d1d5", 100),
-        ("Caso 4 (cxd5 con recaptura de peon)", "k7/8/4p3/3n4/2P5/1N6/8/K7 w - - 0 1", "c4d5", 220),
-        ("Caso 5 (al paso, sin recaptura)", "k7/8/8/3pP3/8/8/8/K7 w - d6 0 1", "e5d6", 100),
-        ("Caso 5b (al paso con recaptura)", "k7/2p5/8/3pP3/8/8/8/K7 w - d6 0 1", "e5d6", 0),
-        ("Caso 6 (FEN del bug, cxb4)", "r1b1k2r/ppqp1ppp/4p3/4n3/1b6/2PQBN2/P1P2PPP/R3KB1R w KQkq - 0 11", "c3b4", 330),
+        (
+            "Caso 1 (captura libre)",
+            "k7/8/8/7p/8/8/8/K6R w - - 0 1",
+            "h1h5",
+            100,
+        ),
+        (
+            "Caso 2 (1v1, mal cambio)",
+            "k2r4/8/8/3p4/8/8/8/K2R4 w - - 0 1",
+            "d1d5",
+            100 - 500,
+        ),
+        (
+            "Caso 3 (2 atacantes vs 1 defensor)",
+            "k2r4/8/8/3p4/8/8/3R4/K2R4 w - - 0 1",
+            "d1d5",
+            100,
+        ),
+        (
+            "Caso 4 (cxd5 con recaptura de peon)",
+            "k7/8/4p3/3n4/2P5/1N6/8/K7 w - - 0 1",
+            "c4d5",
+            220,
+        ),
+        (
+            "Caso 5 (al paso, sin recaptura)",
+            "k7/8/8/3pP3/8/8/8/K7 w - d6 0 1",
+            "e5d6",
+            100,
+        ),
+        (
+            "Caso 5b (al paso con recaptura)",
+            "k7/2p5/8/3pP3/8/8/8/K7 w - d6 0 1",
+            "e5d6",
+            0,
+        ),
+        (
+            "Caso 6 (FEN del bug, cxb4)",
+            "r1b1k2r/ppqp1ppp/4p3/4n3/1b6/2PQBN2/P1P2PPP/R3KB1R w KQkq - 0 11",
+            "c3b4",
+            330,
+        ),
     ];
     for (nombre, fen, uci, esperado) in &casos {
         let b = Board::from_fen(fen).unwrap();
@@ -476,9 +743,22 @@ fn run_see_tests() {
         let r = see::see(&b, &mv);
         let pass = r == *esperado;
         ok &= pass;
-        println!("{} {}: see={} esperado={}", if pass { "OK  " } else { "FALLO" }, nombre, r, esperado);
+        println!(
+            "{} {}: see={} esperado={}",
+            if pass { "OK  " } else { "FALLO" },
+            nombre,
+            r,
+            esperado
+        );
     }
-    println!("{}", if ok { "TODOS LOS CASOS DE SEE OK" } else { "HAY FALLOS EN SEE" });
+    println!(
+        "{}",
+        if ok {
+            "TODOS LOS CASOS DE SEE OK"
+        } else {
+            "HAY FALLOS EN SEE"
+        }
+    );
 
     // Oraculo de fuerza bruta: posiciones al azar (self-play con jugadas
     // aleatorias desde la posicion inicial), comparando see() contra un
@@ -510,7 +790,10 @@ fn run_see_tests() {
         if !valida {
             continue;
         }
-        let capturas: Vec<Move> = movegen::generate_legal(&b).into_iter().filter(|m| m.is_capture()).collect();
+        let capturas: Vec<Move> = movegen::generate_legal(&b)
+            .into_iter()
+            .filter(|m| m.is_capture())
+            .collect();
         for mv in capturas {
             let rapido = see::see(&b, &mv);
             let oraculo = see::see_oracle(&b, &mv);
@@ -519,15 +802,23 @@ fn run_see_tests() {
                 discrepancias += 1;
                 println!(
                     "  DISCREPANCIA: fen='{}' jugada={} see={} oraculo={}",
-                    b.to_fen(), mv.to_uci(), rapido, oraculo
+                    b.to_fen(),
+                    mv.to_uci(),
+                    rapido,
+                    oraculo
                 );
             }
         }
     }
     println!(
         "{} capturas comparadas, {} discrepancias -- {}",
-        total_capturas, discrepancias,
-        if discrepancias == 0 { "SEE COINCIDE CON EL ORACULO" } else { "HAY DISCREPANCIAS, revisar" }
+        total_capturas,
+        discrepancias,
+        if discrepancias == 0 {
+            "SEE COINCIDE CON EL ORACULO"
+        } else {
+            "HAY DISCREPANCIAS, revisar"
+        }
     );
 }
 
@@ -543,7 +834,7 @@ struct BusquedaActiva {
 }
 
 /// Si hay una busqueda en curso, le pide que pare y espera a que termine
-/// (casi instantaneo: el hilo de busqueda revisa la bandera cada 1024 nodos)
+/// (casi instantaneo: el hilo de busqueda revisa la bandera desde el primer nodo y luego cada 256 nodos)
 /// para recuperar el Searcher de un solo hilo, si corresponde. Se llama
 /// defensivamente antes de procesar cualquier comando UCI que no sea
 /// "isready" -- un GUI que cumple el protocolo siempre manda "stop" antes de
@@ -583,18 +874,49 @@ fn parse_setoption(partes: &[&str]) -> Option<(String, Option<String>)> {
     Some((nombre, valor))
 }
 
+fn calcular_movetime_reloj(mio_i: i64, inc_i: i64, movestogo: i64, move_overhead_ms: u64) -> u64 {
+    let mio = mio_i.max(0) as u64;
+    let inc = inc_i.max(0) as u64;
+    let disponible = mio.saturating_sub(move_overhead_ms);
+    const UMBRAL_CORRESPONDENCIA_MS: u64 = 40 * 60 * 1000;
+    let techo = if mio > UMBRAL_CORRESPONDENCIA_MS {
+        3_500
+    } else {
+        20_000
+    };
+    let base = disponible / movestogo.max(1) as u64;
+    let objetivo = base.saturating_add(inc.saturating_mul(8) / 10);
+    objetivo.max(1).min(techo).min(disponible.max(1))
+}
+
 fn uci_loop() {
     let stdin = io::stdin();
     let mut board = Board::from_fen(STARTPOS).unwrap();
     let mut tt_mb: usize = 64;
-    let mut searcher_slot: Option<Searcher> = Some(Searcher::new(tt_mb));
+    let mut move_overhead_ms: u64 = 75;
+    // Lazy SMP y el hilo principal deben compartir una sola TT. Antes se
+    // construía aquí una TT propia y, unas líneas después, otra para SMP;
+    // con Hash=512 eso duplicaba la reserva de memoria desde el arranque.
+    let modo_lmr_inicial = std::env::var("MIMOTOR_LMR").as_deref() != Ok("0");
     let mut game_history: Vec<u64> = Vec::new();
     // MIMOTOR_HILOS sigue funcionando como default de conveniencia para
     // pruebas locales, pero un tester UCI (CCRL y similares) SOLO configura
     // motores por "setoption", nunca por variables de entorno -- por eso
     // "Threads" tambien es una opcion UCI real (ver abajo) que sobreescribe
     // este valor inicial.
-    let mut n_hilos: usize = std::env::var("MIMOTOR_HILOS").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
+    let mut n_hilos: usize = std::env::var("MIMOTOR_HILOS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1)
+        .clamp(1, 16);
+    // Por defecto la quiescence conserva NNUE. Esta opción permite medir la
+    // variante ultrabullet sin depender de variables de entorno ocultas.
+    let mut qsearch_nnue = true;
+    let mut nnue_classical_depth = 0i32;
+    // Para `go movetime <=25` con un único hilo, evita crear un hilo nativo
+    // que solo vive unos milisegundos. Es experimental y apagado por defecto;
+    // el modo normal conserva stop asíncrono sin ninguna variación.
+    let mut sync_ultrabullet = false;
     if let Ok(p) = std::env::var("MIMOTOR_PERSONALIDAD")
         && let Some(pers) = eval::personalidad_desde_texto(&p)
     {
@@ -614,10 +936,27 @@ fn uci_loop() {
     }
     let usar_libro_inicial: bool = std::env::var("MIMOTOR_SIN_LIBRO").as_deref() != Ok("1");
     polyglot::set_activo(usar_libro_inicial);
-    // TT compartida persistente para Lazy SMP -- se construye una sola vez y
-    // se reutiliza entre jugadas de la partida (igual que la TT normal de
-    // un Searcher), no se reconstruye en cada "go".
-    let (mut smp_tt, mut smp_tt_mask) = search::construir_tt(tt_mb);
+    // El camino de un hilo usa una TT local sin Mutex. Solo Lazy SMP necesita
+    // una TT compartida entre hilos; reservarla tambien en Threads=1 añade un
+    // lock/unlock en cada probe sin aportar sincronizacion util.
+    let (mut smp_tt, mut smp_tt_mask) = if n_hilos > 1 {
+        search::construir_tt(tt_mb)
+    } else {
+        (Arc::new(Vec::new()), 0)
+    };
+    let mut searcher_slot: Option<Searcher> = Some(if n_hilos > 1 {
+        Searcher::new_con_tt_compartida(Arc::clone(&smp_tt), smp_tt_mask, modo_lmr_inicial)
+    } else {
+        Searcher::new(tt_mb)
+    });
+    searcher_slot
+        .as_mut()
+        .expect("searcher inicial")
+        .set_qsearch_nnue(qsearch_nnue);
+    searcher_slot
+        .as_mut()
+        .expect("searcher inicial")
+        .set_nnue_classical_depth(nnue_classical_depth);
     let mut activa: Option<BusquedaActiva> = None;
 
     for line in stdin.lock().lines() {
@@ -631,14 +970,15 @@ fn uci_loop() {
         }
         let partes: Vec<&str> = line.split_whitespace().collect();
 
-        // "stop" y "isready" se manejan aparte (no deben esperar a que se
-        // libere una busqueda en curso). Todo lo demas primero se asegura de
+        // "stop" se maneja aparte. "isready" debe esperar a que termine una
+        // busqueda activa para cumplir UCI; todo lo demas primero se asegura de
         // que no haya una busqueda activa antes de tocar board/searcher.
         if partes[0] == "stop" {
             detener_y_recuperar(&mut activa, &mut searcher_slot);
             continue;
         }
         if partes[0] == "isready" {
+            detener_y_recuperar(&mut activa, &mut searcher_slot);
             println!("readyok");
             io::stdout().flush().ok();
             continue;
@@ -647,10 +987,15 @@ fn uci_loop() {
 
         match partes[0] {
             "uci" => {
-                println!("id name MiMotor Tal v7 (Rust)");
+                println!("id name MiMotor Tal v8 Reparado (Rust)");
                 println!("id author Tavito y Claude");
                 println!("option name Hash type spin default 64 min 1 max 1024");
-                println!("option name Threads type spin default {} min 1 max 16", n_hilos);
+                println!("option name Clear Hash type button");
+                println!("option name Move Overhead type spin default 75 min 0 max 5000");
+                println!(
+                    "option name Threads type spin default {} min 1 max 16",
+                    n_hilos
+                );
                 println!("option name Personalidad type combo default tal var tal var universal");
                 println!("option name SyzygyPath type string default <empty>");
                 println!("option name BookPath type string default <empty>");
@@ -659,70 +1004,186 @@ fn uci_loop() {
                 println!("option name NNUEPath type string default <empty>");
                 println!("option name UseNN type check default false");
                 println!("option name NNPath type string default <empty>");
+                println!("option name QSearchNNUE type check default true");
+                println!("option name NNUEClassicalDepth type spin default 0 min 0 max 4");
+                println!("option name SyncUltraBullet type check default false");
                 println!("uciok");
                 io::stdout().flush().ok();
             }
             "setoption" => {
+                let mut reiniciar_tt = false;
                 if let Some((nombre, valor)) = parse_setoption(&partes) {
                     let valor = valor.as_deref();
                     if nombre.eq_ignore_ascii_case("personalidad") {
                         if let Some(valor) = valor {
                             if let Some(pers) = eval::personalidad_desde_texto(valor) {
                                 eval::set_personalidad(pers);
+                                reiniciar_tt = true;
                             } else {
                                 println!("info string valor de Personalidad invalido: {}", valor);
                             }
                         }
                     } else if nombre.eq_ignore_ascii_case("hash") {
                         if let Some(mb) = valor.and_then(|v| v.parse::<usize>().ok()) {
-                            // El nuevo tamano se aplica recien en el proximo
-                            // "ucinewgame" (igual que la mayoria de los motores
-                            // UCI: cambiar el tamano de una TT compartida a
-                            // mitad de partida no es seguro ni tiene sentido).
                             tt_mb = mb.clamp(1, 1024);
+                            reiniciar_tt = true;
+                        }
+                    } else if nombre.eq_ignore_ascii_case("clear hash") {
+                        reiniciar_tt = true;
+                    } else if nombre.eq_ignore_ascii_case("move overhead") {
+                        if let Some(ms) = valor.and_then(|v| v.parse::<u64>().ok()) {
+                            move_overhead_ms = ms.min(5000);
                         }
                     } else if nombre.eq_ignore_ascii_case("threads") {
                         if let Some(n) = valor.and_then(|v| v.parse::<usize>().ok()) {
                             n_hilos = n.clamp(1, 16);
+                            // Cambiar entre local y Lazy SMP requiere cambiar
+                            // de backend de TT; descartar el contenido evita
+                            // mezclar una tabla de otro modo de busqueda.
+                            reiniciar_tt = true;
                         }
                     } else if nombre.eq_ignore_ascii_case("syzygypath") {
                         if let Some(path) = valor {
                             match syzygy::init(path) {
-                                Ok(max) => println!("info string tablas Syzygy cargadas ({} piezas max)", max),
-                                Err(e) => println!("info string error cargando tablas Syzygy: {}", e),
+                                Ok(max) => println!(
+                                    "info string tablas Syzygy cargadas ({} piezas max)",
+                                    max
+                                ),
+                                Err(e) => {
+                                    println!("info string error cargando tablas Syzygy: {}", e)
+                                }
                             }
                         }
                     } else if nombre.eq_ignore_ascii_case("bookpath") {
                         if let Some(path) = valor {
                             match polyglot::init(path) {
-                                Ok(n) => println!("info string libro de aperturas cargado ({} entradas)", n),
-                                Err(e) => println!("info string error cargando libro de aperturas: {}", e),
+                                Ok(n) => println!(
+                                    "info string libro de aperturas cargado ({} entradas)",
+                                    n
+                                ),
+                                Err(e) => {
+                                    println!("info string error cargando libro de aperturas: {}", e)
+                                }
                             }
                         }
                     } else if nombre.eq_ignore_ascii_case("ownbook") {
                         if let Some(v) = valor {
                             polyglot::set_activo(v.eq_ignore_ascii_case("true"));
                         }
-                    } else if nombre.eq_ignore_ascii_case("nnuepath") || nombre.eq_ignore_ascii_case("nnpath") {
+                    } else if nombre.eq_ignore_ascii_case("qsearchnnue") {
+                        if let Some(v) = valor {
+                            qsearch_nnue = v.eq_ignore_ascii_case("true");
+                            // Los valores de quiescence llegan a bounds de
+                            // padres guardados en TT: no mezclar ambos modos.
+                            reiniciar_tt = true;
+                        }
+                    } else if nombre.eq_ignore_ascii_case("nnueclassicaldepth") {
+                        if let Some(v) = valor.and_then(|v| v.parse::<i32>().ok()) {
+                            nnue_classical_depth = v.clamp(0, 4);
+                            reiniciar_tt = true;
+                        }
+                    } else if nombre.eq_ignore_ascii_case("syncultrabullet") {
+                        if let Some(v) = valor {
+                            sync_ultrabullet = v.eq_ignore_ascii_case("true");
+                        }
+                    } else if nombre.eq_ignore_ascii_case("nnuepath")
+                        || nombre.eq_ignore_ascii_case("nnpath")
+                    {
                         if let Some(path) = valor {
                             match neural::cargar_detallado(path) {
-                                Ok(checksum) => println!("info string NNUE cargada desde {} (checksum {:016x})", path, checksum),
-                                Err(e) => println!("info string error cargando NNUE desde {}: {}", path, e),
+                                Ok(checksum) => {
+                                    println!(
+                                        "info string NNUE cargada desde {} checksum {:016x}",
+                                        path, checksum
+                                    );
+                                    reiniciar_tt = true;
+                                }
+                                Err(e) => println!(
+                                    "info string error cargando NNUE desde {}: {} (se conserva la red anterior)",
+                                    path, e
+                                ),
                             }
                         }
-                    } else if (nombre.eq_ignore_ascii_case("usennue") || nombre.eq_ignore_ascii_case("usenn")) && let Some(v) = valor {
-                        neural::set_activa(v.eq_ignore_ascii_case("true"));
+                    } else if (nombre.eq_ignore_ascii_case("usennue")
+                        || nombre.eq_ignore_ascii_case("usenn"))
+                        && let Some(v) = valor
+                    {
+                        let activar = v.eq_ignore_ascii_case("true");
+                        if activar && !neural::hay_red_cargada() {
+                            println!(
+                                "info string UseNNUE pendiente: se activara al cargar NNUEPath"
+                            );
+                        }
+                        // set_activa conserva la solicitud aunque los pesos
+                        // lleguen despues, evitando depender del orden UCI.
+                        neural::set_activa(activar);
+                        reiniciar_tt = true;
                     }
+                }
+                if reiniciar_tt {
+                    // Los scores de TT dependen de la evaluacion activa. Al
+                    // cambiar personalidad/NNUE, o al pedir Clear Hash/Hash,
+                    // se reconstruyen ambas tablas para no mezclar resultados.
+                    // Liberar la tabla anterior antes de reservar la nueva:
+                    // evita un pico de dos tablas completas durante Hash.
+                    drop(searcher_slot.take());
+                    let old_tt = std::mem::replace(&mut smp_tt, Arc::new(Vec::new()));
+                    drop(old_tt);
+                    let modo_lmr = std::env::var("MIMOTOR_LMR").as_deref() != Ok("0");
+                    if n_hilos > 1 {
+                        let (nueva_tt, nueva_mask) = search::construir_tt(tt_mb);
+                        searcher_slot = Some(Searcher::new_con_tt_compartida(
+                            Arc::clone(&nueva_tt),
+                            nueva_mask,
+                            modo_lmr,
+                        ));
+                        smp_tt = nueva_tt;
+                        smp_tt_mask = nueva_mask;
+                    } else {
+                        searcher_slot = Some(Searcher::new(tt_mb));
+                        smp_tt = Arc::new(Vec::new());
+                        smp_tt_mask = 0;
+                    }
+                    searcher_slot
+                        .as_mut()
+                        .expect("searcher reconstruido")
+                        .set_qsearch_nnue(qsearch_nnue);
+                    searcher_slot
+                        .as_mut()
+                        .expect("searcher reconstruido")
+                        .set_nnue_classical_depth(nnue_classical_depth);
                 }
                 io::stdout().flush().ok();
             }
             "ucinewgame" => {
                 board = Board::from_fen(STARTPOS).unwrap();
                 game_history.clear();
-                searcher_slot = Some(Searcher::new(tt_mb));
-                let (nueva_tt, nueva_mask) = search::construir_tt(tt_mb);
-                smp_tt = nueva_tt;
-                smp_tt_mask = nueva_mask;
+                drop(searcher_slot.take());
+                let old_tt = std::mem::replace(&mut smp_tt, Arc::new(Vec::new()));
+                drop(old_tt);
+                let modo_lmr = std::env::var("MIMOTOR_LMR").as_deref() != Ok("0");
+                if n_hilos > 1 {
+                    let (nueva_tt, nueva_mask) = search::construir_tt(tt_mb);
+                    searcher_slot = Some(Searcher::new_con_tt_compartida(
+                        Arc::clone(&nueva_tt),
+                        nueva_mask,
+                        modo_lmr,
+                    ));
+                    smp_tt = nueva_tt;
+                    smp_tt_mask = nueva_mask;
+                } else {
+                    searcher_slot = Some(Searcher::new(tt_mb));
+                    smp_tt = Arc::new(Vec::new());
+                    smp_tt_mask = 0;
+                }
+                searcher_slot
+                    .as_mut()
+                    .expect("searcher de nueva partida")
+                    .set_qsearch_nnue(qsearch_nnue);
+                searcher_slot
+                    .as_mut()
+                    .expect("searcher de nueva partida")
+                    .set_nnue_classical_depth(nnue_classical_depth);
             }
             "position" => {
                 let mut idx = 1;
@@ -730,7 +1191,10 @@ fn uci_loop() {
                     board = Board::from_fen(STARTPOS).unwrap();
                     idx = 2;
                 } else if partes.get(1) == Some(&"fen") {
-                    let moves_pos = partes.iter().position(|&p| p == "moves").unwrap_or(partes.len());
+                    let moves_pos = partes
+                        .iter()
+                        .position(|&p| p == "moves")
+                        .unwrap_or(partes.len());
                     let fen = partes[2..moves_pos].join(" ");
                     board = match Board::from_fen(&fen) {
                         Ok(b) => b,
@@ -740,6 +1204,9 @@ fn uci_loop() {
                         }
                     };
                     idx = moves_pos;
+                } else {
+                    println!("info string error de position: se esperaba startpos o fen");
+                    continue;
                 }
                 // Historial de claves Zobrist de la partida real (para deteccion
                 // de repeticion) -- clave de CADA posicion ancestro, sin incluir
@@ -766,7 +1233,10 @@ fn uci_loop() {
                     let handle = std::thread::spawn(move || {
                         let (mv, sc, _) = s.search_fixed_depth(&board_copy, depth);
                         println!("info score cp {}", sc);
-                        println!("bestmove {}", mv.map(|m| m.to_uci()).unwrap_or_else(|| "0000".to_string()));
+                        println!(
+                            "bestmove {}",
+                            mv.map(|m| m.to_uci()).unwrap_or_else(|| "0000".to_string())
+                        );
                         io::stdout().flush().ok();
                         Some(s)
                     });
@@ -781,37 +1251,46 @@ fn uci_loop() {
                     movetime = partes.get(i + 1).and_then(|s| s.parse().ok());
                 } else if !infinito {
                     if let Some(i) = partes.iter().position(|&p| p == "wtime") {
-                        let wtime: i64 = partes.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(10000);
+                        let wtime: i64 = partes
+                            .get(i + 1)
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(10000);
                         let btime_i = partes.iter().position(|&p| p == "btime");
-                        let btime: i64 = btime_i.and_then(|j| partes.get(j + 1)).and_then(|s| s.parse().ok()).unwrap_or(10000);
-                        let winc: i64 = partes.iter().position(|&p| p == "winc")
-                            .and_then(|j| partes.get(j + 1)).and_then(|s| s.parse().ok()).unwrap_or(0);
-                        let binc: i64 = partes.iter().position(|&p| p == "binc")
-                            .and_then(|j| partes.get(j + 1)).and_then(|s| s.parse().ok()).unwrap_or(0);
-                        let movestogo: i64 = partes.iter().position(|&p| p == "movestogo")
-                            .and_then(|j| partes.get(j + 1)).and_then(|s| s.parse().ok()).unwrap_or(30);
-                        let (mio, inc) = if board.turn == types::Color::White { (wtime, winc) } else { (btime, binc) };
-                        // Reparto clasico: tiempo restante / jugadas que quedan
-                        // hasta el proximo control, mas la mayor parte del
-                        // incremento (dejando margen para no pasarse de largo).
-                        // Techo ADAPTATIVO (no uno solo fijo): el techo bajo
-                        // (3.5s) que hubo antes se puso para relojes de
-                        // CORRESPONDENCIA (base de dias, llega como wtime en
-                        // ms -- sin tope, la formula salia en horas reales,
-                        // medido en partidas reales). Pero aplicado siempre
-                        // tambien capaba blitz/rapid/clasica -- en el
-                        // config.yml del bot, max_base de partidas normales
-                        // es 1800s (30 min), asi que cualquier wtime bien por
-                        // encima de eso (>40 min) es casi con certeza
-                        // correspondencia, no una partida real de tiempo
-                        // rapido/clasico -- ahi si aplica el techo estricto.
-                        // Con tiempo real (rapid/clasica largas), un techo de
-                        // 20s deja pensar mucho mas sin arriesgar el reloj
-                        // (20s todavia es una fraccion chica de 10-30 min).
-                        const UMBRAL_CORRESPONDENCIA_MS: i64 = 40 * 60 * 1000;
-                        let techo: u64 = if mio > UMBRAL_CORRESPONDENCIA_MS { 3_500 } else { 20_000 };
-                        let base = mio / movestogo.max(1);
-                        movetime = Some(((base + inc * 8 / 10).max(50) as u64).min(techo));
+                        let btime: i64 = btime_i
+                            .and_then(|j| partes.get(j + 1))
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(10000);
+                        let winc: i64 = partes
+                            .iter()
+                            .position(|&p| p == "winc")
+                            .and_then(|j| partes.get(j + 1))
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(0);
+                        let binc: i64 = partes
+                            .iter()
+                            .position(|&p| p == "binc")
+                            .and_then(|j| partes.get(j + 1))
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(0);
+                        let movestogo: i64 = partes
+                            .iter()
+                            .position(|&p| p == "movestogo")
+                            .and_then(|j| partes.get(j + 1))
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(30);
+                        let (mio_i, inc_i) = if board.turn == types::Color::White {
+                            (wtime, winc)
+                        } else {
+                            (btime, binc)
+                        };
+                        // Reparto con margen real: nunca inventa un minimo
+                        // mayor al reloj y siempre reserva Move Overhead.
+                        movetime = Some(calcular_movetime_reloj(
+                            mio_i,
+                            inc_i,
+                            movestogo,
+                            move_overhead_ms,
+                        ));
                     } else {
                         movetime = Some(2000); // "go" sin ningun parametro de tiempo: default razonable
                     }
@@ -821,17 +1300,71 @@ fn uci_loop() {
                 let board_copy = board;
                 let hist_copy = game_history.clone();
 
+                // A relojes extremadamente cortos el overhead de crear y
+                // despertar el hilo UCI pesa tanto como una fracción de la
+                // búsqueda. Como `go movetime` ya tiene deadline duro y este
+                // camino es exclusivo de <=25ms/Threads=1, responder de modo
+                // síncrono gana tiempo real sin dejar una búsqueda infinita
+                // imposible de detener.
+                if n_hilos == 1
+                    && sync_ultrabullet
+                    && !partes.contains(&"ponder")
+                    && movetime.is_some_and(|ms| ms <= 25)
+                {
+                    let mut s = searcher_slot.take().expect("searcher ultrabullet");
+                    s.set_game_history(hist_copy);
+                    s.set_external_stop(Some(Arc::clone(&stop_flag)));
+                    let (mv, _sc, _) =
+                        s.search_time(&board_copy, movetime, 64, |depth, score, nodes, ms| {
+                            println!(
+                                "info depth {} score cp {} nodes {} time {}",
+                                depth, score, nodes, ms
+                            );
+                            io::stdout().flush().ok();
+                        });
+                    println!(
+                        "bestmove {}",
+                        mv.map(|m| m.to_uci()).unwrap_or_else(|| "0000".to_string())
+                    );
+                    io::stdout().flush().ok();
+                    searcher_slot = Some(s);
+                    continue;
+                }
+
                 if n_hilos > 1 {
                     let modo_lmr = searcher_slot.as_ref().unwrap().modo_lmr;
+                    let qsearch_nnue = searcher_slot.as_ref().unwrap().qsearch_nnue;
+                    let nnue_classical_depth = searcher_slot.as_ref().unwrap().nnue_classical_depth;
                     let tt = Arc::clone(&smp_tt);
                     let mask = smp_tt_mask;
                     let flag = Arc::clone(&stop_flag);
                     let handle = std::thread::spawn(move || {
-                        let (mv, sc, nodos, _) = search::buscar_lazy_smp(
-                            &board_copy, movetime, 64, n_hilos, &tt, mask, modo_lmr, &hist_copy, flag,
+                        let t0 = std::time::Instant::now();
+                        let (mv, sc, nodos, resultados) = search::buscar_lazy_smp(
+                            &board_copy,
+                            movetime,
+                            64,
+                            n_hilos,
+                            &tt,
+                            mask,
+                            modo_lmr,
+                            qsearch_nnue,
+                            nnue_classical_depth,
+                            &hist_copy,
+                            flag,
                         );
-                        println!("info score cp {} nodes {}", sc, nodos);
-                        println!("bestmove {}", mv.map(|m| m.to_uci()).unwrap_or_else(|| "0000".to_string()));
+                        let profundidad =
+                            resultados.iter().map(|r| r.profundidad).max().unwrap_or(0);
+                        let ms = t0.elapsed().as_millis().max(1) as u64;
+                        let nps = nodos.saturating_mul(1000) / ms;
+                        println!(
+                            "info depth {} score cp {} nodes {} time {} nps {}",
+                            profundidad, sc, nodos, ms, nps
+                        );
+                        println!(
+                            "bestmove {}",
+                            mv.map(|m| m.to_uci()).unwrap_or_else(|| "0000".to_string())
+                        );
                         io::stdout().flush().ok();
                         None
                     });
@@ -841,11 +1374,18 @@ fn uci_loop() {
                     s.set_game_history(hist_copy);
                     s.set_external_stop(Some(Arc::clone(&stop_flag)));
                     let handle = std::thread::spawn(move || {
-                        let (mv, _sc, _) = s.search_time(&board_copy, movetime, 64, |depth, score, nodes, ms| {
-                            println!("info depth {} score cp {} nodes {} time {}", depth, score, nodes, ms);
-                            io::stdout().flush().ok();
-                        });
-                        println!("bestmove {}", mv.map(|m| m.to_uci()).unwrap_or_else(|| "0000".to_string()));
+                        let (mv, _sc, _) =
+                            s.search_time(&board_copy, movetime, 64, |depth, score, nodes, ms| {
+                                println!(
+                                    "info depth {} score cp {} nodes {} time {}",
+                                    depth, score, nodes, ms
+                                );
+                                io::stdout().flush().ok();
+                            });
+                        println!(
+                            "bestmove {}",
+                            mv.map(|m| m.to_uci()).unwrap_or_else(|| "0000".to_string())
+                        );
                         io::stdout().flush().ok();
                         Some(s)
                     });
@@ -864,15 +1404,45 @@ fn uci_loop() {
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
-    use super::parse_setoption;
+    use super::{calcular_movetime_reloj, parse_setoption, parse_uci_move};
+    use crate::board::Board;
 
     #[test]
     fn setoption_conserva_ruta_con_espacios() {
-        let partes = ["setoption", "name", "NNPath", "value", "/Users/Tavito/Mi", "Motor/red.bin"];
+        let partes = [
+            "setoption",
+            "name",
+            "NNPath",
+            "value",
+            "/Users/Tavito/Mi",
+            "Motor/red.bin",
+        ];
         assert_eq!(
             parse_setoption(&partes),
-            Some(("NNPath".to_string(), Some("/Users/Tavito/Mi Motor/red.bin".to_string())))
+            Some((
+                "NNPath".to_string(),
+                Some("/Users/Tavito/Mi Motor/red.bin".to_string())
+            ))
         );
+    }
+    #[test]
+    fn reloj_nunca_supera_lo_disponible() {
+        assert_eq!(calcular_movetime_reloj(20, 0, 30, 75), 1);
+        assert!(calcular_movetime_reloj(1_000, 0, 1, 75) <= 925);
+        assert!(calcular_movetime_reloj(10_000, 100, 30, 75) <= 9_925);
+    }
+
+    #[test]
+    fn correspondencia_conserva_techo() {
+        assert_eq!(calcular_movetime_reloj(86_400_000, 0, 30, 75), 3_500);
+    }
+
+    #[test]
+    fn parse_uci_rechaza_sufijos_y_promociones_invalidas() {
+        let b = Board::startpos();
+        assert!(parse_uci_move(&b, "e2e4junk").is_none());
+        assert!(parse_uci_move(&b, "e2e4x").is_none());
+        assert!(parse_uci_move(&b, "e2e4").is_some());
     }
 }
 
@@ -911,12 +1481,12 @@ fn main() {
                 run_see_tests();
                 return;
             }
-            "repetitiontest" => {
-                run_repetition_tests();
+            "endgametest" => {
+                run_endgame_tests();
                 return;
             }
-            "quiescheck" => {
-                run_quiescence_check_tests();
+            "repetitiontest" => {
+                run_repetition_tests();
                 return;
             }
             "lmrdiag" => {

@@ -9,9 +9,9 @@
 use crate::board::{Board, CASTLE_BK, CASTLE_BQ, CASTLE_WK, CASTLE_WQ};
 use crate::movegen::generate_legal;
 use crate::polyglot_random::POLYGLOT_RANDOM;
-use crate::types::{file_of, make_square, rank_of, Color, Move, PieceType};
-use std::sync::atomic::{AtomicBool, Ordering};
+use crate::types::{Color, Move, PieceType, file_of, make_square, rank_of};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Clone, Copy)]
 struct Entrada {
@@ -32,9 +32,15 @@ pub fn set_activo(v: bool) {
 }
 
 pub fn init(path: &str) -> Result<usize, String> {
+    if LIBRO.get().is_some() {
+        return Err("ya hay un libro cargado; reinicia el motor para cambiar BookPath".to_string());
+    }
     let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
     if bytes.is_empty() || bytes.len() % 16 != 0 {
-        return Err("tamano de archivo invalido para un libro polyglot (debe ser multiplo de 16 bytes)".to_string());
+        return Err(
+            "tamano de archivo invalido para un libro polyglot (debe ser multiplo de 16 bytes)"
+                .to_string(),
+        );
     }
     let mut entradas: Vec<Entrada> = bytes
         .chunks_exact(16)
@@ -46,7 +52,9 @@ pub fn init(path: &str) -> Result<usize, String> {
         .collect();
     entradas.sort_by_key(|e| e.key);
     let n = entradas.len();
-    let _ = LIBRO.set(entradas);
+    LIBRO
+        .set(entradas)
+        .map_err(|_| "no se pudo instalar el libro de aperturas".to_string())?;
     Ok(n)
 }
 
@@ -86,7 +94,11 @@ fn polyglot_key(b: &Board) -> u64 {
     // casilla marcada) -- mismo criterio que usa el estandar Polyglot.
     if let Some(ep) = b.ep_square {
         let ep_file = file_of(ep) as i32;
-        let fila_atacante = if b.turn == Color::White { rank_of(ep) as i32 - 1 } else { rank_of(ep) as i32 + 1 };
+        let fila_atacante = if b.turn == Color::White {
+            rank_of(ep) as i32 - 1
+        } else {
+            rank_of(ep) as i32 + 1
+        };
         let mut hay_atacante = false;
         for df in [-1i32, 1] {
             let f = ep_file + df;
@@ -138,7 +150,9 @@ fn decodificar_jugada(b: &Board, raw: u16) -> Option<Move> {
         to_sq
     };
 
-    generate_legal(b).into_iter().find(|m| m.from == from_sq && m.to == to_real && m.promotion == promotion)
+    generate_legal(b)
+        .into_iter()
+        .find(|m| m.from == from_sq && m.to == to_real && m.promotion == promotion)
 }
 
 /// Jugada del libro para la posicion actual (blancas O negras, ambos colores

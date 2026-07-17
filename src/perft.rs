@@ -20,6 +20,9 @@ pub fn perft(b: &Board, depth: u32) -> u64 {
 /// perft "divide": nodos por cada jugada de raíz -- útil para encontrar en qué
 /// rama exacta diverge un perft incorrecto comparando contra otro motor.
 pub fn perft_divide(b: &Board, depth: u32) -> Vec<(String, u64)> {
+    if depth == 0 {
+        return Vec::new();
+    }
     let moves = generate_legal(b);
     let mut out = Vec::new();
     for mv in &moves {
@@ -28,4 +31,23 @@ pub fn perft_divide(b: &Board, depth: u32) -> Vec<(String, u64)> {
         out.push((mv.to_uci(), n));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn divide_profundidad_cero_no_desborda() {
+        let b = Board::startpos();
+        assert!(perft_divide(&b, 0).is_empty());
+    }
+
+    #[test]
+    fn perft_inicio_hasta_tres() {
+        let b = Board::startpos();
+        assert_eq!(perft(&b, 1), 20);
+        assert_eq!(perft(&b, 2), 400);
+        assert_eq!(perft(&b, 3), 8_902);
+    }
 }

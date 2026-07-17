@@ -8,7 +8,7 @@
 
 use crate::board::Board;
 use crate::movegen::generate_legal;
-use crate::types::{square_from_name, Move, PieceType};
+use crate::types::{Move, PieceType, square_from_name};
 use shakmaty::{CastlingMode, Chess};
 use shakmaty_syzygy::{Tablebase, Wdl};
 use std::str::FromStr;
@@ -26,13 +26,21 @@ pub const TB_WIN: i32 = crate::search::MATE - 2000;
 /// como maximo quedaron cubiertas, o Err si el directorio no tiene tablas
 /// validas. Se llama una sola vez al arrancar el motor.
 pub fn init(path: &str) -> Result<usize, String> {
+    if TABLES.get().is_some() {
+        return Err(
+            "las tablas Syzygy ya estan cargadas; reinicia el motor para cambiar SyzygyPath"
+                .to_string(),
+        );
+    }
     let mut tables = Tablebase::new();
     let n = tables.add_directory(path).map_err(|e| e.to_string())?;
     if n == 0 {
         return Err("no se encontraron archivos de tabla en el directorio".to_string());
     }
     let max = tables.max_pieces();
-    let _ = TABLES.set(tables);
+    TABLES
+        .set(tables)
+        .map_err(|_| "no se pudieron instalar las tablas Syzygy".to_string())?;
     Ok(max)
 }
 
@@ -89,8 +97,14 @@ fn uci_a_jugada(b: &Board, uci: &str) -> Option<Move> {
     }
     let from = square_from_name(&uci[0..2])?;
     let to = square_from_name(&uci[2..4])?;
-    let promo = if bytes.len() >= 5 { PieceType::from_char(bytes[4] as char) } else { None };
-    moves.into_iter().find(|m| m.from == from && m.to == to && m.promotion == promo)
+    let promo = if bytes.len() >= 5 {
+        PieceType::from_char(bytes[4] as char)
+    } else {
+        None
+    };
+    moves
+        .into_iter()
+        .find(|m| m.from == from && m.to == to && m.promotion == promo)
 }
 
 /// Jugada recomendada por la tabla en la raiz, via DTZ (distance-to-zero):

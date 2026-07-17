@@ -1,10 +1,10 @@
 use crate::bitboard::{
-    bishop_attacks, bit, king_attacks, knight_attacks, pawn_attacks, pop_lsb, rook_attacks,
-    Bitboard, EMPTY,
+    Bitboard, EMPTY, bishop_attacks, bit, king_attacks, knight_attacks, pawn_attacks, pop_lsb,
+    rook_attacks,
 };
 use crate::types::{
-    file_of, make_square, rank_of, square_from_name, square_name, Color, Move, MoveFlag,
-    PieceType, Square, ALL_PIECE_TYPES,
+    ALL_PIECE_TYPES, Color, Move, MoveFlag, PieceType, Square, file_of, make_square, rank_of,
+    square_from_name, square_name,
 };
 use crate::zobrist::keys;
 
@@ -70,6 +70,24 @@ impl Board {
         self.occupied = self.occupied_co[0] | self.occupied_co[1];
     }
 
+    /// Devuelve el archivo de en-passant que debe entrar en la clave
+    /// Zobrist. Siguiendo la convencion de Polyglot, solo se hashea cuando
+    /// el bando al turno tiene al menos un peon que podria capturar en esa
+    /// casilla. Esto evita distinguir posiciones con exactamente las mismas
+    /// jugadas legales solo porque el FEN conserve una casilla EP inutil.
+    #[inline]
+    pub fn ep_hash_file(&self) -> Option<usize> {
+        let ep = self.ep_square?;
+        let peones = self.pieces[self.turn as usize][PieceType::Pawn as usize];
+        let atacantes = pawn_attacks(self.turn.opposite(), ep) & peones;
+        (atacantes != 0).then_some(file_of(ep) as usize)
+    }
+
+    #[inline]
+    pub fn ep_is_capturable(&self) -> bool {
+        self.ep_hash_file().is_some()
+    }
+
     fn recompute_zobrist(&mut self) {
         let k = keys();
         let mut z = 0u64;
@@ -83,8 +101,8 @@ impl Board {
             }
         }
         z ^= k.castling[(self.castling_rights & 0xF) as usize];
-        if let Some(ep) = self.ep_square {
-            z ^= k.en_passant_file[file_of(ep) as usize];
+        if let Some(file) = self.ep_hash_file() {
+            z ^= k.en_passant_file[file];
         }
         if self.turn == Color::Black {
             z ^= k.side_to_move;
@@ -118,7 +136,11 @@ impl Board {
                     if file >= 8 {
                         return Err(format!("fila FEN demasiado larga: {}", rank_str));
                     }
-                    let color = if ch.is_uppercase() { Color::White } else { Color::Black };
+                    let color = if ch.is_uppercase() {
+                        Color::White
+                    } else {
+                        Color::Black
+                    };
                     let pt = PieceType::from_char(ch)
                         .ok_or_else(|| format!("carácter de pieza inválido: {}", ch))?;
                     let sq = make_square(file, rank);
@@ -168,29 +190,81 @@ impl Board {
                 return Err(format!("casilla al paso en rango inválido: {}", parts[3]));
             }
             if (b.turn == Color::White && rank != 5) || (b.turn == Color::Black && rank != 2) {
-                return Err(format!("casilla al paso incompatible con el turno: {}", parts[3]));
+                return Err(format!(
+                    "casilla al paso incompatible con el turno: {}",
+                    parts[3]
+                ));
             }
             Some(sq)
         };
 
         // 5-6. Contadores (opcionales en algunos FEN recortados)
         b.halfmove_clock = match parts.get(4) {
-            Some(value) => value.parse().map_err(|_| format!("reloj de medio movimiento inválido: {}", value))?,
+            Some(value) => value
+                .parse()
+                .map_err(|_| format!("reloj de medio movimiento inválido: {}", value))?,
             None => 0,
         };
         b.fullmove_number = match parts.get(5) {
-            Some(value) => value.parse().map_err(|_| format!("número de jugada inválido: {}", value))?,
+            Some(value) => value
+                .parse()
+                .map_err(|_| format!("número de jugada inválido: {}", value))?,
             None => 1,
         };
         if b.fullmove_number == 0 {
             return Err("número de jugada debe ser al menos 1".to_string());
         }
 
+        b.recompute_derived();
+
+        // Validaciones estructurales para que king_square/in_check nunca
+        // reciban un tablero imposible y terminen desplazando por una casilla
+        // 64. Cada color debe tener exactamente un rey y no pueden tocarse.
+        for color in [Color::White, Color::Black] {
+            let reyes = b.pieces[color as usize][PieceType::King as usize].count_ones();
+            if reyes != 1 {
+                return Err(format!(
+                    "se esperaba exactamente un rey {:?}, hay {}",
+                    color, reyes
+                ));
+            }
+        }
+        let rey_w = crate::bitboard::lsb(b.pieces[Color::White as usize][PieceType::King as usize]);
+        let rey_b = crate::bitboard::lsb(b.pieces[Color::Black as usize][PieceType::King as usize]);
+        if king_attacks(rey_w) & bit(rey_b) != 0 {
+            return Err("los reyes no pueden estar adyacentes".to_string());
+        }
+        let filas_extremas = 0xFF000000000000FFu64;
+        if (b.pieces[0][PieceType::Pawn as usize] | b.pieces[1][PieceType::Pawn as usize])
+            & filas_extremas
+            != 0
+        {
+            return Err("peon en primera u octava fila".to_string());
+        }
+        if let Some(ep) = b.ep_square {
+            if b.occupied & bit(ep) != 0 {
+                return Err("la casilla al paso debe estar vacia".to_string());
+            }
+            let pawn_sq = if b.turn == Color::White {
+                ep - 8
+            } else {
+                ep + 8
+            };
+            let last_mover = b.turn.opposite();
+            if b.pieces[last_mover as usize][PieceType::Pawn as usize] & bit(pawn_sq) == 0 {
+                return Err("casilla al paso sin peon que haya hecho doble avance".to_string());
+            }
+        }
+
         let tiene = |color, pt, sq| b.pieces[color as usize][pt as usize] & bit(sq) != 0;
-        if !tiene(Color::White, PieceType::King, make_square(4, 0)) && cr & (CASTLE_WK | CASTLE_WQ) != 0 {
+        if !tiene(Color::White, PieceType::King, make_square(4, 0))
+            && cr & (CASTLE_WK | CASTLE_WQ) != 0
+        {
             return Err("enroque blanco sin rey en e1".to_string());
         }
-        if !tiene(Color::Black, PieceType::King, make_square(4, 7)) && cr & (CASTLE_BK | CASTLE_BQ) != 0 {
+        if !tiene(Color::Black, PieceType::King, make_square(4, 7))
+            && cr & (CASTLE_BK | CASTLE_BQ) != 0
+        {
             return Err("enroque negro sin rey en e8".to_string());
         }
         if cr & CASTLE_WK != 0 && !tiene(Color::White, PieceType::Rook, make_square(7, 0)) {
@@ -206,7 +280,6 @@ impl Board {
             return Err("enroque negro largo sin torre en a8".to_string());
         }
 
-        b.recompute_derived();
         b.recompute_zobrist();
         Ok(b)
     }
@@ -273,8 +346,10 @@ impl Board {
         let white = self.pieces[Color::White as usize];
         let black = self.pieces[Color::Black as usize];
 
-        attackers |= knight_attacks(sq) & (white[PieceType::Knight as usize] | black[PieceType::Knight as usize]);
-        attackers |= king_attacks(sq) & (white[PieceType::King as usize] | black[PieceType::King as usize]);
+        attackers |= knight_attacks(sq)
+            & (white[PieceType::Knight as usize] | black[PieceType::Knight as usize]);
+        attackers |=
+            king_attacks(sq) & (white[PieceType::King as usize] | black[PieceType::King as usize]);
         let bishops_queens = white[PieceType::Bishop as usize]
             | white[PieceType::Queen as usize]
             | black[PieceType::Bishop as usize]
@@ -327,12 +402,14 @@ impl Board {
         let k = keys();
 
         // Limpiar la clave de al paso anterior (se vuelve a poner si aplica)
-        if let Some(ep) = b.ep_square {
-            b.zobrist ^= k.en_passant_file[file_of(ep) as usize];
+        if let Some(file) = b.ep_hash_file() {
+            b.zobrist ^= k.en_passant_file[file];
         }
         b.ep_square = None;
 
-        let (_, moving_pt) = self.piece_at(mv.from).expect("make_move: no hay pieza en 'from'");
+        let (_, moving_pt) = self
+            .piece_at(mv.from)
+            .expect("make_move: no hay pieza en 'from'");
 
         // Captura (normal o al paso)
         if mv.flag == MoveFlag::EnPassant {
@@ -388,7 +465,6 @@ impl Board {
         if mv.flag == MoveFlag::DoublePush {
             let ep_sq = make_square(file_of(mv.from), (rank_of(mv.from) + rank_of(mv.to)) / 2);
             b.ep_square = Some(ep_sq);
-            b.zobrist ^= k.en_passant_file[file_of(ep_sq) as usize];
         }
 
         // Actualizar derechos de enroque
@@ -426,14 +502,17 @@ impl Board {
         b.zobrist ^= k.side_to_move;
 
         b.recompute_derived();
+        if let Some(file) = b.ep_hash_file() {
+            b.zobrist ^= k.en_passant_file[file];
+        }
         b
     }
 
     pub fn make_null_move(&self) -> Board {
         let mut b = *self;
         let k = keys();
-        if let Some(ep) = b.ep_square {
-            b.zobrist ^= k.en_passant_file[file_of(ep) as usize];
+        if let Some(file) = b.ep_hash_file() {
+            b.zobrist ^= k.en_passant_file[file];
         }
         b.ep_square = None;
         b.turn = b.turn.opposite();
@@ -462,5 +541,30 @@ mod tests {
     fn rechaza_casilla_al_paso_invalida() {
         let fen = "4k3/8/8/8/8/8/8/4K3 w - i9 0 1";
         assert!(Board::from_fen(fen).is_err());
+    }
+    #[test]
+    fn zobrist_ignora_ep_si_nadie_puede_capturar() {
+        let con_ep = Board::from_fen("4k3/8/8/8/4P3/8/8/4K3 b - e3 0 1").unwrap();
+        let sin_ep = Board::from_fen("4k3/8/8/8/4P3/8/8/4K3 b - - 0 1").unwrap();
+        assert_eq!(con_ep.zobrist, sin_ep.zobrist);
+        assert!(!con_ep.ep_is_capturable());
+    }
+
+    #[test]
+    fn zobrist_incluye_ep_si_hay_captura_posible() {
+        let con_ep = Board::from_fen("4k3/8/8/8/3pP3/8/8/4K3 b - e3 0 1").unwrap();
+        let sin_ep = Board::from_fen("4k3/8/8/8/3pP3/8/8/4K3 b - - 0 1").unwrap();
+        assert_ne!(con_ep.zobrist, sin_ep.zobrist);
+        assert!(con_ep.ep_is_capturable());
+    }
+
+    #[test]
+    fn rechaza_fen_sin_reyes() {
+        assert!(Board::from_fen("8/8/8/8/8/8/8/8 w - - 0 1").is_err());
+    }
+
+    #[test]
+    fn rechaza_reyes_adyacentes() {
+        assert!(Board::from_fen("8/8/8/8/8/8/4k3/4K3 w - - 0 1").is_err());
     }
 }

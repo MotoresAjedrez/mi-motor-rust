@@ -4,9 +4,10 @@
 // en el reporte final de la sesion).
 
 use crate::board::Board;
-use crate::eval::evaluate_with_nnue;
-use crate::neural::{crear_acumulador, NnueAccumulator};
-use crate::movegen::{generate_legal, generate_pseudo_legal};
+use crate::eval::{
+    EvalState, crear_eval_state, evaluate_classical_with_state, evaluate_with_state,
+};
+use crate::movegen::generate_legal;
 use crate::types::{Move, MoveFlag};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -28,8 +29,8 @@ const MAX_PLY: u32 = 64;
 const CONTEMPT_UMBRAL: i32 = 500;
 const CONTEMPT_PENALIZACION: i32 = 200;
 
-fn draw_score(b: &Board, nnue: Option<&NnueAccumulator>) -> i32 {
-    let se = evaluate_with_nnue(b, nnue);
+fn draw_score(b: &Board, eval_state: &EvalState) -> i32 {
+    let se = evaluate_with_state(b, eval_state);
     if se > CONTEMPT_UMBRAL {
         -CONTEMPT_PENALIZACION
     } else if se < -CONTEMPT_UMBRAL {
@@ -48,7 +49,7 @@ fn solo_peones_y_rey(b: &Board, color: crate::types::Color) -> bool {
         == 0
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TTFlag {
     Exact,
     Alpha,
@@ -59,11 +60,52 @@ enum TTFlag {
 pub struct TTEntry {
     key: u64,
     depth: i32,
+    // Los scores de mate se guardan normalizados respecto de la raiz. Al
+    // recuperar la entrada se convierten de nuevo usando el ply actual.
     score: i32,
     flag: TTFlag,
     best: Option<Move>,
 }
 
+#[inline]
+fn score_to_tt(score: i32, ply: u32) -> i32 {
+    if score >= MATE - 1000 {
+        score + ply as i32
+    } else if score <= -MATE + 1000 {
+        score - ply as i32
+    } else {
+        score
+    }
+}
+
+#[inline]
+fn score_from_tt(score: i32, ply: u32) -> i32 {
+    if score >= MATE - 1000 {
+        score - ply as i32
+    } else if score <= -MATE + 1000 {
+        score + ply as i32
+    } else {
+        score
+    }
+}
+
+/// Reserva interna adicional al `Move Overhead` de UCI.
+///
+/// En ultrabullet, 5 ms fijos sacrifican una fracción enorme del presupuesto.
+/// Se mantiene una reserva conservadora de 3 ms para absorber planificación
+/// del sistema y la salida UCI; la ganancia de profundidad debe venir de
+/// rendimiento real, no de gastar el reloj de forma insegura.
+fn margen_interno_tiempo(movetime_ms: u64) -> u64 {
+    match movetime_ms {
+        0..=2 => 0,
+        3..=10 => 2,
+        11..=25 => 3,
+        26..=100 => 4,
+        _ => 5,
+    }
+}
+
+#[derive(Debug)]
 pub struct TimeUp;
 
 const MAX_KILLER_PLY: usize = 100; // margen sobre MAX_PLY para cubrir extensiones de jaque
@@ -84,17 +126,47 @@ fn cont_idx(prev_pt: usize, prev_to: usize, pt: usize, to: usize) -> usize {
 // indice de la tabla al mismo tiempo, algo relativamente raro con una
 // tabla de tamano razonable.
 pub type SharedTT = Vec<Mutex<Option<TTEntry>>>;
+type LocalTT = Vec<Option<TTEntry>>;
+
+/// Un solo hilo no necesita sincronización para su tabla de transposición.
+/// Lazy SMP conserva el backend compartido con `Mutex` por casillero.
+enum TablaTransposicion {
+    Local(LocalTT),
+    Compartida(Arc<SharedTT>),
+}
+
+fn capacidad_tt(tt_mb: usize, slot_size: usize) -> usize {
+    let bytes = tt_mb.saturating_mul(1024 * 1024);
+    let objetivo = (bytes / slot_size.max(1)).max(1);
+    let mut n_entries = objetivo.next_power_of_two();
+    if n_entries > objetivo {
+        n_entries >>= 1;
+    }
+    n_entries.max(1)
+}
 
 pub fn construir_tt(tt_mb: usize) -> (Arc<SharedTT>, usize) {
-    let entry_size = std::mem::size_of::<Option<TTEntry>>().max(1);
-    let mut n_entries = (tt_mb * 1024 * 1024 / entry_size).max(1024);
-    n_entries = n_entries.next_power_of_two() >> 1; // asegurar potencia de 2 sin pasarse
+    // Contar el Mutex real, no solo Option<TTEntry>, para que "Hash 64"
+    // consuma aproximadamente 64 MiB y no bastante mas.
+    let slot_size = std::mem::size_of::<Mutex<Option<TTEntry>>>().max(1);
+    let n_entries = capacidad_tt(tt_mb, slot_size);
     let tt: SharedTT = (0..n_entries).map(|_| Mutex::new(None)).collect();
     (Arc::new(tt), n_entries - 1)
 }
 
+fn construir_tt_local(tt_mb: usize) -> (LocalTT, usize) {
+    let n_entries = capacidad_tt(tt_mb, std::mem::size_of::<Option<TTEntry>>());
+    (vec![None; n_entries], n_entries - 1)
+}
+
+pub fn limpiar_tt(tt: &SharedTT) {
+    for slot in tt {
+        *slot.lock().expect("candado TT envenenado") = None;
+    }
+}
+
 pub struct Searcher {
-    tt: Arc<SharedTT>,
+    tt: TablaTransposicion,
     tt_mask: usize,
     pub nodes: u64,
     deadline: Option<Instant>,
@@ -123,6 +195,15 @@ pub struct Searcher {
     // default, por pedido explicito: es de las tecnicas mas propensas a
     // bugs sutiles y no se activa "por si acaso".
     pub modo_singular: bool,
+    // La quiescence puede omitir NNUE de forma experimental. El resto del
+    // árbol conserva la mezcla completa; esta bandera solo existe para medir
+    // si el coste del horizonte a relojes ultracortos devuelve Elo real.
+    pub qsearch_nnue: bool,
+    // Profundidad máxima en la que los hijos usan solo ClassicalAccumulator.
+    // Cero conserva el comportamiento previo bit a bit. Es una puerta de
+    // rendimiento experimental: evita construir deltas NNUE que ningún nodo
+    // superficial llegará a consultar antes de entrar a quiescence clásica.
+    pub nnue_classical_depth: i32,
     // Historial de repeticion: claves Zobrist de la PARTIDA REAL (persiste
     // entre llamadas a go, la maneja el loop UCI) + las de la linea actual
     // de busqueda (crece/decrece durante la recursion, como el "self.hist"
@@ -132,10 +213,25 @@ pub struct Searcher {
     path: Vec<u64>,
     pub lmr_intentos: u64,
     pub lmr_reintentos: u64,
+    // Hindsight reductions: para el hijo alcanzado mediante una busqueda
+    // reducida guardamos la evaluacion estatica del padre y la reduccion
+    // aplicada. Los vectores estan indexados por ply y son locales al hilo.
+    hindsight_parent_eval: Vec<i32>,
+    hindsight_reduction: Vec<i32>,
     // Lazy SMP: si esta activo, este hilo intercambia las 2 primeras
     // jugadas del orden en la RAIZ (una vez, al armar el orden inicial) para
     // no explorar exactamente la misma linea primero que los demas hilos.
     pub variante_orden_raiz: bool,
+    // Lazy SMP: variacion de PARAMETROS de busqueda entre hilos (no solo
+    // orden de jugadas). Cada hilo helper explora el arbol con una
+    // reduccion de null-move ligeramente distinta (R=2, 3 o 1 segun el
+    // indice del hilo modulo 3) -- hilos con R mas chico podan menos y
+    // llegan menos hondo pero mas exhaustivo; con R mas grande podan mas
+    // agresivo y llegan mas hondo pero mas arriesgado. Al compartir la
+    // misma TT, las lineas que un hilo descarta por error las puede
+    // encontrar otro con distinta agresividad -- variacion real de
+    // busqueda, no solo de que jugada se mira primero.
+    pub null_move_r_extra: i32,
     // Bandera compartida con el hilo principal del loop UCI: permite que el
     // comando "stop" interrumpa una busqueda en curso (que corre en su
     // propio hilo -- ver uci_loop en main.rs) sin depender solo del deadline
@@ -157,9 +253,9 @@ fn valor_pieza(pt: crate::types::PieceType) -> i32 {
 
 impl Searcher {
     pub fn new(tt_mb: usize) -> Searcher {
-        let (tt, tt_mask) = construir_tt(tt_mb);
+        let (tt, tt_mask) = construir_tt_local(tt_mb);
         Searcher {
-            tt,
+            tt: TablaTransposicion::Local(tt),
             tt_mask,
             nodes: 0,
             deadline: None,
@@ -174,11 +270,16 @@ impl Searcher {
             modo_lmr: std::env::var("MIMOTOR_LMR").as_deref() != Ok("0"),
             modo_aspiration: std::env::var("MIMOTOR_NO_ASPIRATION").as_deref() != Ok("1"),
             modo_singular: std::env::var("MIMOTOR_SINGULAR").as_deref() == Ok("1"),
+            qsearch_nnue: true,
+            nnue_classical_depth: 0,
             game_history: Vec::new(),
             path: Vec::new(),
             lmr_intentos: 0,
             lmr_reintentos: 0,
+            hindsight_parent_eval: vec![0; MAX_KILLER_PLY],
+            hindsight_reduction: vec![0; MAX_KILLER_PLY],
             variante_orden_raiz: false,
+            null_move_r_extra: 0,
             external_stop: None,
         }
     }
@@ -189,7 +290,7 @@ impl Searcher {
     /// sentido compartirlos, cada hilo ordena sus propias jugadas).
     pub fn new_con_tt_compartida(tt: Arc<SharedTT>, tt_mask: usize, modo_lmr: bool) -> Searcher {
         Searcher {
-            tt,
+            tt: TablaTransposicion::Compartida(tt),
             tt_mask,
             nodes: 0,
             deadline: None,
@@ -200,11 +301,16 @@ impl Searcher {
             modo_lmr,
             modo_aspiration: std::env::var("MIMOTOR_NO_ASPIRATION").as_deref() != Ok("1"),
             modo_singular: std::env::var("MIMOTOR_SINGULAR").as_deref() == Ok("1"),
+            qsearch_nnue: true,
+            nnue_classical_depth: 0,
             game_history: Vec::new(),
             path: Vec::new(),
             lmr_intentos: 0,
             lmr_reintentos: 0,
+            hindsight_parent_eval: vec![0; MAX_KILLER_PLY],
+            hindsight_reduction: vec![0; MAX_KILLER_PLY],
             variante_orden_raiz: false,
+            null_move_r_extra: 0,
             external_stop: None,
         }
     }
@@ -215,7 +321,97 @@ impl Searcher {
         self.external_stop = flag;
     }
 
-    fn registrar_corte(&mut self, mv: Move, ply: u32, depth: i32, prev: Option<(usize, usize)>, pt_mv: usize) {
+    pub fn set_qsearch_nnue(&mut self, active: bool) {
+        self.qsearch_nnue = active;
+    }
+
+    pub fn set_nnue_classical_depth(&mut self, depth: i32) {
+        self.nnue_classical_depth = depth.clamp(0, 4);
+    }
+
+    #[inline]
+    fn evaluar_quiescence(&self, b: &Board, eval_state: &EvalState) -> i32 {
+        if self.qsearch_nnue {
+            evaluate_with_state(b, eval_state)
+        } else {
+            evaluate_classical_with_state(b, eval_state)
+        }
+    }
+
+    #[inline]
+    fn siguiente_estado_quiescence(
+        &self,
+        eval_state: &EvalState,
+        antes: &Board,
+        despues: &Board,
+    ) -> EvalState {
+        if self.qsearch_nnue {
+            eval_state.despues_de_jugada(antes, despues)
+        } else {
+            eval_state.despues_de_jugada_solo_clasica(antes, despues)
+        }
+    }
+
+    #[inline]
+    fn siguiente_estado_busqueda(
+        &self,
+        eval_state: &EvalState,
+        antes: &Board,
+        despues: &Board,
+        profundidad_hijo: i32,
+    ) -> EvalState {
+        // No soltar NNUE si la jugada deja al rival en jaque: negamax le
+        // concede una extensión, por lo que ya no es realmente un nodo
+        // superficial. Esto conserva la táctica forzada en el borde.
+        if self.nnue_classical_depth > 0
+            && profundidad_hijo <= self.nnue_classical_depth
+            && !despues.in_check(despues.turn)
+        {
+            eval_state.despues_de_jugada_solo_clasica(antes, despues)
+        } else {
+            eval_state.despues_de_jugada(antes, despues)
+        }
+    }
+
+    pub fn clear_hash(&mut self) {
+        match &mut self.tt {
+            TablaTransposicion::Local(tt) => {
+                for slot in tt {
+                    *slot = None;
+                }
+            }
+            TablaTransposicion::Compartida(tt) => limpiar_tt(tt),
+        }
+    }
+
+    /// Decae (no resetea de golpe) las tablas de history/continuation
+    /// history al arrancar cada "go" real de la partida. Sin esto, la
+    /// tabla solo se inicializa una vez (Searcher::new) y ACUMULA sin
+    /// limite durante toda la partida -- estadisticas de la apertura
+    /// (jugada 5) pueden seguir sesgando el ordenamiento en el medio
+    /// juego o el final (jugada 40+), donde el tipo de posicion es
+    /// completamente distinto. Dividir a la mitad (no resetear a cero)
+    /// preserva la señal relativa de jugadas que siguen funcionando bien
+    /// mientras deja que estadisticas viejas pesen cada vez menos.
+    fn decaer_history(&mut self) {
+        for fila in self.history.iter_mut() {
+            for v in fila.iter_mut() {
+                *v /= 2;
+            }
+        }
+        for v in self.cont_history.iter_mut() {
+            *v /= 2;
+        }
+    }
+
+    fn registrar_corte(
+        &mut self,
+        mv: Move,
+        ply: u32,
+        depth: i32,
+        prev: Option<(usize, usize)>,
+        pt_mv: usize,
+    ) {
         if mv.is_capture() {
             return; // MVV-LVA/SEE ya ordenan las capturas primero, no necesitan refuerzo
         }
@@ -277,50 +473,127 @@ impl Searcher {
 
     fn tt_probe(&self, key: u64) -> Option<TTEntry> {
         let idx = self.tt_index(key);
-        match *self.tt[idx].lock().unwrap() {
-            Some(e) if e.key == key => Some(e),
-            _ => None,
+        match &self.tt {
+            TablaTransposicion::Local(tt) => match tt[idx] {
+                Some(e) if e.key == key => Some(e),
+                _ => None,
+            },
+            TablaTransposicion::Compartida(tt) => match *tt[idx].lock().unwrap() {
+                Some(e) if e.key == key => Some(e),
+                _ => None,
+            },
         }
     }
 
-    // v12: politica de reemplazo "prefiere profundidad" -- antes se
-    // sobreescribia SIEMPRE sin condicion, asi que una entrada profunda (cara
-    // de calcular, muy valiosa) se podia perder por una superficial que cayo
-    // en el mismo casillero (quiescence guarda con depth<=0, por ejemplo).
-    // Ahora solo se reemplaza si la entrada nueva es igual o mas profunda que
-    // la que ya esta (o el casillero esta vacio) -- protege las entradas
-    // caras sin necesitar un esquema de "generacion/antiguedad" mas complejo.
-    fn tt_store(&mut self, key: u64, depth: i32, score: i32, flag: TTFlag, best: Option<Move>) {
-        let idx = self.tt_index(key);
-        let mut slot = self.tt[idx].lock().unwrap();
-        let reemplazar = match *slot {
+    // Reemplazo por profundidad, pero una colision de OTRA clave siempre debe
+    // poder ocupar el casillero. A igual profundidad se prefiere una entrada
+    // Exact sobre una cota Alpha/Beta.
+    fn tt_store(
+        &mut self,
+        key: u64,
+        depth: i32,
+        score: i32,
+        ply: u32,
+        flag: TTFlag,
+        best: Option<Move>,
+    ) {
+        let reemplazar = |slot: Option<TTEntry>| match slot {
             None => true,
-            Some(existing) => depth >= existing.depth,
+            Some(existing) if existing.key != key => true,
+            Some(existing) => {
+                depth > existing.depth
+                    || (depth == existing.depth
+                        && flag == TTFlag::Exact
+                        && existing.flag != TTFlag::Exact)
+            }
         };
-        if reemplazar {
-            *slot = Some(TTEntry { key, depth, score, flag, best });
+        let entry = TTEntry {
+            key,
+            depth,
+            score: score_to_tt(score, ply),
+            flag,
+            best,
+        };
+        let idx = self.tt_index(key);
+        match &mut self.tt {
+            TablaTransposicion::Local(tt) => {
+                if reemplazar(tt[idx]) {
+                    tt[idx] = Some(entry);
+                }
+            }
+            TablaTransposicion::Compartida(tt) => {
+                let mut slot = tt[idx].lock().unwrap();
+                if reemplazar(*slot) {
+                    *slot = Some(entry);
+                }
+            }
         }
     }
 
     fn check_time(&mut self) -> Result<(), TimeUp> {
         self.nodes += 1;
-        if !self.stop && self.nodes & 1023 == 0 {
-            if let Some(dl) = self.deadline && Instant::now() >= dl {
+        if !self.stop && (self.nodes == 1 || self.nodes & 255 == 0) {
+            if let Some(dl) = self.deadline
+                && Instant::now() >= dl
+            {
                 self.stop = true;
             }
-            if !self.stop && let Some(flag) = &self.external_stop && flag.load(Ordering::Relaxed) {
+            if !self.stop
+                && let Some(flag) = &self.external_stop
+                && flag.load(Ordering::Relaxed)
+            {
                 self.stop = true;
             }
         }
-        if self.stop {
-            Err(TimeUp)
-        } else {
-            Ok(())
-        }
+        if self.stop { Err(TimeUp) } else { Ok(()) }
     }
 
     fn order_moves(&self, b: &Board, moves: &mut [Move], tt_move: Option<Move>) {
         self.order_moves_ply(b, moves, tt_move, MAX_KILLER_PLY as u32, None);
+    }
+
+    #[inline]
+    fn clave_orden_movimiento(
+        &self,
+        b: &Board,
+        mv: &Move,
+        tt_move: Option<Move>,
+        ply: u32,
+        prev: Option<(usize, usize)>,
+        see_precalculado: Option<i32>,
+    ) -> i32 {
+        if Some(*mv) == tt_move {
+            return -1_000_000;
+        }
+        if mv.is_capture() {
+            let see = see_precalculado.unwrap_or_else(|| crate::see::see(b, mv));
+            if see >= 0 {
+                return -(10_000 + see);
+            }
+            return 1000 - see;
+        }
+        if mv.promotion.is_some() {
+            return -5000;
+        }
+        let p = ply as usize;
+        if p < MAX_KILLER_PLY {
+            let killers = self.killers[p];
+            if killers[0] == Some(*mv) {
+                return -3000;
+            }
+            if killers[1] == Some(*mv) {
+                return -2900;
+            }
+        }
+        let h = self.history[mv.from as usize][mv.to as usize];
+        let ch = match prev {
+            Some((prev_pt, prev_to)) => {
+                let pt_mv = b.piece_at(mv.from).map(|(_, pt)| pt as usize).unwrap_or(0);
+                self.cont_history[cont_idx(prev_pt, prev_to, pt_mv, mv.to as usize)]
+            }
+            None => 0,
+        };
+        -(h + ch)
     }
 
     /// Igual que order_moves pero ademas usa killers/history (por ply) para
@@ -328,132 +601,118 @@ impl Searcher {
     /// `prev` es (pieza, casillero_destino) de la jugada rival que llevo a
     /// esta posicion (None si no se conoce, p.ej. en la raiz) -- alimenta la
     /// continuation history para las jugadas silenciosas.
-    fn order_moves_ply(&self, b: &Board, moves: &mut [Move], tt_move: Option<Move>, ply: u32, prev: Option<(usize, usize)>) {
-        let p = ply as usize;
-        let killers = if p < MAX_KILLER_PLY { Some(self.killers[p]) } else { None };
-        moves.sort_by_key(|mv| {
-            if Some(*mv) == tt_move {
-                return -1_000_000;
-            }
-            if mv.is_capture() {
-                -(10_000 + crate::see::see(b, mv))
-            } else if mv.promotion.is_some() {
-                -5000
-            } else if killers.is_some_and(|k| k[0] == Some(*mv)) {
-                -3000
-            } else if killers.is_some_and(|k| k[1] == Some(*mv)) {
-                -2900
-            } else {
-                let h = self.history[mv.from as usize][mv.to as usize];
-                let ch = match prev {
-                    Some((prev_pt, prev_to)) => {
-                        let pt_mv = b.piece_at(mv.from).map(|(_, pt)| pt as usize).unwrap_or(0);
-                        self.cont_history[cont_idx(prev_pt, prev_to, pt_mv, mv.to as usize)]
-                    }
-                    None => 0,
-                };
-                -(h + ch)
-            }
-        });
+    fn order_moves_ply(
+        &self,
+        b: &Board,
+        moves: &mut [Move],
+        tt_move: Option<Move>,
+        ply: u32,
+        prev: Option<(usize, usize)>,
+    ) {
+        // `sort_by_key` recalculaba SEE varias veces por captura durante las
+        // comparaciones del ordenamiento. Cachear la clave conserva el mismo
+        // orden estable, pero calcula SEE una sola vez por jugada.
+        moves.sort_by_cached_key(|mv| self.clave_orden_movimiento(b, mv, tt_move, ply, prev, None));
     }
 
-    fn quiescence(&mut self, b: &Board, nnue: Option<&NnueAccumulator>, mut alpha: i32, beta: i32, ply: u32) -> Result<i32, TimeUp> {
+    fn quiescence(
+        &mut self,
+        b: &Board,
+        eval_state: &EvalState,
+        mut alpha: i32,
+        beta: i32,
+        ply: u32,
+    ) -> Result<i32, TimeUp> {
         self.check_time()?;
-
-        if ply >= MAX_PLY {
-            return Ok(evaluate_with_nnue(b, nnue));
+        // Quiescence también puede cruzar una secuencia de 50 plies sin
+        // captura ni peón. No usar el stand-pat allí: por regla es tablas.
+        if b.halfmove_clock >= 100 {
+            return Ok(draw_score(b, eval_state));
         }
+        let en_jaque = b.in_check(b.turn);
 
-        // v13: en jaque, "plantarse" con stand_pat no tiene sentido -- las
-        // unicas jugadas legales son evasiones, y si no hay ninguna es mate.
-        // Sin este caso especial, quiescence podia devolver la evaluacion
-        // estatica de una posicion donde el unico resultado real es mate o
-        // una evasion forzada muy mala (efecto horizonte real, no una
-        // exageracion -- confirmado con casos de prueba especificos antes de
-        // activar esto). En jaque se buscan TODAS las evasiones legales (no
-        // solo capturas) y sin las podas normales de quiescence (delta/SEE),
-        // que asumen que hay una alternativa silenciosa razonable -- en
-        // jaque no la hay por definicion.
-        if b.in_check(b.turn) {
-            let evasiones = generate_legal(b);
+        // En jaque no existe "stand pat": quedarse quieto es ilegal. Se deben
+        // buscar TODAS las evasiones legales, incluidas jugadas silenciosas.
+        if en_jaque {
+            let mut evasiones = generate_legal(b);
             if evasiones.is_empty() {
                 return Ok(-MATE + ply as i32);
             }
-            let mut mejor = -INFINITO;
-            let mut ordenadas = evasiones;
-            self.order_moves(b, &mut ordenadas, None);
-            for mv in ordenadas {
+            self.order_moves_ply(b, &mut evasiones, None, ply, None);
+            if ply >= MAX_PLY {
+                // Tope defensivo contra secuencias patologicas de jaques. Aun
+                // detectamos mate arriba; para posiciones no terminales usamos
+                // la evaluacion estatica en vez de desbordar la pila.
+                return Ok(self.evaluar_quiescence(b, eval_state));
+            }
+            let mut best = -INFINITO;
+            for mv in evasiones {
                 let next = b.make_move(&mv);
-                let next_nnue = nnue.map(|acumulador| acumulador.despues_de_jugada(b, &next));
-                let sc = -self.quiescence(&next, next_nnue.as_ref(), -beta, -alpha, ply + 1)?;
-                if sc > mejor {
-                    mejor = sc;
-                }
-                if sc > alpha {
-                    alpha = sc;
-                }
+                let next_eval = self.siguiente_estado_quiescence(eval_state, b, &next);
+                let sc = -self.quiescence(&next, &next_eval, -beta, -alpha, ply + 1)?;
+                best = best.max(sc);
+                alpha = alpha.max(sc);
                 if alpha >= beta {
                     break;
                 }
             }
-            return Ok(mejor);
+            return Ok(best);
         }
 
-        let stand_pat = evaluate_with_nnue(b, nnue);
+        let stand_pat = self.evaluar_quiescence(b, eval_state);
+        if ply >= MAX_PLY {
+            return Ok(stand_pat);
+        }
         if stand_pat >= beta {
             return Ok(beta);
         }
-        if stand_pat > alpha {
-            alpha = stand_pat;
-        }
+        alpha = alpha.max(stand_pat);
 
-        // v12: ademas de capturas, se incluyen promociones a dama SIN captura
-        // (peon que corona caminando). Sin esto, un peon a un paso de coronar
-        // podia quedar fuera de quiescence por completo (solo capturas) --
-        // efecto horizonte clasico en finales de peones pasados: la busqueda
-        // principal SI ve la coronacion (genera todas las jugadas legales),
-        // pero si quiescence corta ahi antes de esa jugada especifica, evalua
-        // con stand_pat sin haber "visto" que el peon corona. Sub-promociones
-        // (a torre/alfil/caballo) casi nunca son mejores que coronar dama, no
-        // vale la pena el costo de tambien incluirlas aqui.
-        let mut moves: Vec<Move> = generate_pseudo_legal(b)
+        // Generar legales aqui cuesta un poco mas que filtrar pseudo-legales,
+        // pero arregla dos casos de correctitud: ahogado en el horizonte y
+        // capturas/promociones que dejan al propio rey en jaque.
+        let legales = generate_legal(b);
+        if legales.is_empty() {
+            return Ok(0); // ahogado
+        }
+        let mut moves: Vec<(Move, Option<i32>)> = legales
             .into_iter()
-            .filter(|m| m.is_capture() || m.promotion == Some(crate::types::PieceType::Queen))
+            .filter(|m| m.is_capture() || m.promotion.is_some())
+            .map(|m| {
+                let see = m.is_capture().then(|| crate::see::see(b, &m));
+                (m, see)
+            })
             .collect();
-        self.order_moves(b, &mut moves, None);
+        // En quiescence la poda SEE se aplica despues del ordenamiento. Llevar
+        // el resultado junto a la jugada evita calcular el mismo SEE dos veces.
+        moves.sort_by_key(|(mv, see)| self.clave_orden_movimiento(b, mv, None, ply, None, *see));
 
         let mut best = stand_pat;
-        for mv in moves {
-            // Filtro SEE: descarta capturas claramente perdedoras (no las
-            // prueba ni gasta tiempo en ellas). Margen -50, no se aplica a
-            // promociones (la poda delta de abajo ya las valora aparte).
-            if mv.promotion.is_none() && crate::see::see(b, &mv) < -50 {
+        for (mv, see) in moves {
+            let next = b.make_move(&mv);
+            let da_jaque = next.in_check(next.turn);
+
+            // Nunca podar promociones ni jaques por SEE/delta: una captura
+            // materialmente mala puede ser mate o forzar una secuencia tactica.
+            if !da_jaque && mv.promotion.is_none() && see.unwrap_or(0) < -50 {
                 continue;
             }
             let victim = if mv.flag == MoveFlag::EnPassant {
                 100
             } else {
-                b.piece_at(mv.to).map(|(_, pt)| valor_pieza(pt)).unwrap_or(0)
+                b.piece_at(mv.to)
+                    .map(|(_, pt)| valor_pieza(pt))
+                    .unwrap_or(0)
             };
-            let mut ganancia = victim;
-            if mv.promotion.is_some() {
-                ganancia += 800;
+            let promo_gain = mv.promotion.map(|pt| valor_pieza(pt) - 100).unwrap_or(0);
+            if !da_jaque && stand_pat + victim + promo_gain + 250 <= alpha {
+                continue;
             }
-            if stand_pat + ganancia + 250 <= alpha {
-                continue; // poda delta
-            }
-            let next = b.make_move(&mv);
-            if next.in_check(b.turn) {
-                continue; // ilegal: propio rey quedaria en jaque
-            }
-            let next_nnue = nnue.map(|acumulador| acumulador.despues_de_jugada(b, &next));
-            let sc = -self.quiescence(&next, next_nnue.as_ref(), -beta, -alpha, ply + 1)?;
-            if sc > best {
-                best = sc;
-            }
-            if sc > alpha {
-                alpha = sc;
-            }
+
+            let next_eval = self.siguiente_estado_quiescence(eval_state, b, &next);
+            let sc = -self.quiescence(&next, &next_eval, -beta, -alpha, ply + 1)?;
+            best = best.max(sc);
+            alpha = alpha.max(sc);
             if alpha >= beta {
                 break;
             }
@@ -471,11 +730,21 @@ impl Searcher {
     // (se propaga, no se resetea a cada paso) y ninguno intenta su propia
     // singular extension.
     #[allow(clippy::collapsible_if, clippy::too_many_arguments)]
-    fn negamax(&mut self, b: &Board, nnue: Option<&NnueAccumulator>, mut depth: i32, mut alpha: i32, beta: i32, ply: u32, prev: Option<(usize, usize)>, en_sondeo_se: bool) -> Result<i32, TimeUp> {
+    fn negamax(
+        &mut self,
+        b: &Board,
+        eval_state: &EvalState,
+        mut depth: i32,
+        mut alpha: i32,
+        beta: i32,
+        ply: u32,
+        prev: Option<(usize, usize)>,
+        en_sondeo_se: bool,
+    ) -> Result<i32, TimeUp> {
         self.check_time()?;
 
         if b.halfmove_clock >= 100 {
-            return Ok(draw_score(b, nnue));
+            return Ok(draw_score(b, eval_state));
         }
 
         // Repeticion: si esta posicion ya aparecio entre los ancestros
@@ -490,7 +759,7 @@ impl Searcher {
         if hc > 0 {
             let start = self.path.len().saturating_sub(hc);
             if self.path[start..].contains(&b.zobrist) {
-                return Ok(draw_score(b, nnue));
+                return Ok(draw_score(b, eval_state));
             }
         }
 
@@ -501,7 +770,9 @@ impl Searcher {
         // dentro del arbol de busqueda. No se prueba en la raiz (eso lo
         // maneja search_time/search_fixed_depth aparte, via DTZ, para elegir
         // la jugada que progresa de verdad, no solo el resultado).
-        if ply > 0 && let Some(wdl) = crate::syzygy::probe_wdl(b) {
+        if ply > 0
+            && let Some(wdl) = crate::syzygy::probe_wdl(b)
+        {
             return Ok(wdl);
         }
 
@@ -510,15 +781,39 @@ impl Searcher {
             depth += 1; // extension de jaque
         }
 
+        // Hindsight, RFP, futility y LMR pueden pedir la misma evaluacion
+        // estatica del MISMO nodo. La personalidad y el acumulador quedan
+        // fijos durante una busqueda, asi que memoizarla localmente es
+        // exactamente equivalente y evita repetir una mezcla NNUE+clasica.
+        let mut static_eval_cache: Option<i32> = None;
+
+        // Hindsight reductions, adaptado al LMR entero de MiMotor. Si una
+        // jugada reducida deja una posicion peor de lo que sugeria la eval
+        // del padre, recuperamos el ply perdido. Si la posicion mejora con
+        // claridad, aceptamos un ply menos. Solo actua sobre hijos que
+        // realmente llegaron mediante LMR; no cambia nodos PV normales.
+        let p = ply as usize;
+        if !en_jaque && p > 0 && p < MAX_KILLER_PLY && self.hindsight_reduction[p] > 0 {
+            let eval_actual =
+                *static_eval_cache.get_or_insert_with(|| evaluate_with_state(b, eval_state));
+            let eval_delta = eval_actual + self.hindsight_parent_eval[p - 1];
+            if eval_delta < 0 {
+                depth += 1;
+            } else if depth >= 2 && eval_delta > 57 {
+                depth -= 1;
+            }
+        }
+
         if depth <= 0 || ply >= MAX_PLY {
-            return self.quiescence(b, nnue, alpha, beta, ply);
+            return self.quiescence(b, eval_state, alpha, beta, ply);
         }
 
         let alpha_orig = alpha;
         let key = b.zobrist;
         let mut tt_move = None;
         let mut tt_entry_full: Option<TTEntry> = None;
-        if let Some(entry) = self.tt_probe(key) {
+        if let Some(mut entry) = self.tt_probe(key) {
+            entry.score = score_from_tt(entry.score, ply);
             tt_move = entry.best;
             tt_entry_full = Some(entry);
             if entry.depth >= depth {
@@ -528,6 +823,22 @@ impl Searcher {
                     TTFlag::Alpha if entry.score <= alpha => return Ok(entry.score),
                     _ => {}
                 }
+            }
+        }
+
+        // Poda de futilidad inversa (reverse futility / static null move): si
+        // la evaluacion estatica ya supera a beta por un margen que crece con
+        // la profundidad, es muy improbable que la busqueda real encuentre
+        // algo peor -- se poda sin generar jugadas. Solo a poca profundidad
+        // (el margen se vuelve prohibitivo mas alla) y lejos de puntajes de
+        // mate (la eval estatica no es fiable para distinguirlos).
+        const RFP_PROF_MAX: i32 = 8;
+        const RFP_MARGEN_POR_PLY: i32 = 120;
+        if !en_jaque && depth <= RFP_PROF_MAX && beta.abs() < MATE - 1000 {
+            let static_eval =
+                *static_eval_cache.get_or_insert_with(|| evaluate_with_state(b, eval_state));
+            if static_eval - RFP_MARGEN_POR_PLY * depth >= beta {
+                return Ok(static_eval - RFP_MARGEN_POR_PLY * depth);
             }
         }
 
@@ -543,12 +854,51 @@ impl Searcher {
             && alpha > -(MATE - 1000)
             && !solo_peones_y_rey(b, b.turn)
         {
+            // Reduccion adaptativa: a mas profundidad, mas se puede confiar
+            // en la poda (el sondeo reducido sigue siendo barato en
+            // proporcion) -- +1 a partir de profundidad 6, +1 mas a partir
+            // de profundidad 12. Conservador a proposito: la vez anterior
+            // que se toco LMR de forma agresiva costo ~320 ELO, asi que acá
+            // el techo es bajo (maximo +2 sobre el R base) y nunca deja
+            // menos de 1 ply de busqueda real tras la reduccion.
+            let mut r_adaptativo = NULL_MOVE_R;
+            if depth >= 6 {
+                r_adaptativo += 1;
+            }
+            if depth >= 12 {
+                r_adaptativo += 1;
+            }
+            let r = (r_adaptativo + self.null_move_r_extra).clamp(1, depth - 1);
             let next = b.make_null_move();
-            let next_nnue = nnue.map(|acumulador| acumulador.despues_de_jugada(b, &next));
-            let sc_null = -self.negamax(&next, next_nnue.as_ref(), depth - 1 - NULL_MOVE_R, -beta, -beta + 1, ply + 1, None, en_sondeo_se)?;
+            let next_eval = self.siguiente_estado_busqueda(eval_state, b, &next, depth - 1 - r);
+            let sc_null = -self.negamax(
+                &next,
+                &next_eval,
+                depth - 1 - r,
+                -beta,
+                -beta + 1,
+                ply + 1,
+                None,
+                en_sondeo_se,
+            )?;
             if sc_null >= beta {
                 return Ok(beta);
             }
+        }
+
+        // Internal Iterative Reduction (IIR): si no hay jugada de la TT en
+        // este nodo (nunca se completo una busqueda aqui a esta profundidad
+        // o mayor), no hay ninguna pista de cual jugada probar primero -- el
+        // orden de jugadas sera peor y la busqueda completa a profundidad
+        // real es menos eficiente. Se reduce 1 ply antes de generar/ordenar
+        // jugadas: la busqueda reducida suele completar una entrada de TT
+        // (con su propia mejor jugada) que despues SI ordena bien la
+        // busqueda real. No aplica en jaque (la extension de jaque ya
+        // gestiona la profundidad ahi) ni a profundidad baja (el ahorro no
+        // compensa el costo de una pasada extra).
+        const IIR_PROF_MIN: i32 = 4;
+        if !en_jaque && tt_move.is_none() && depth >= IIR_PROF_MIN {
+            depth -= 1;
         }
 
         let mut moves = generate_legal(b);
@@ -599,8 +949,18 @@ impl Searcher {
                             continue;
                         }
                         let next = b.make_move(mv);
-                        let next_nnue = nnue.map(|acumulador| acumulador.despues_de_jugada(b, &next));
-                        match self.negamax(&next, next_nnue.as_ref(), sdepth, -sbeta, -sbeta + 1, ply + 1, None, true) {
+                        let next_eval =
+                            self.siguiente_estado_busqueda(eval_state, b, &next, sdepth);
+                        match self.negamax(
+                            &next,
+                            &next_eval,
+                            sdepth,
+                            -sbeta,
+                            -sbeta + 1,
+                            ply + 1,
+                            None,
+                            true,
+                        ) {
                             Ok(v) => {
                                 let sc = -v;
                                 if sc > mejor_otra {
@@ -634,7 +994,20 @@ impl Searcher {
         // dado bien en un mini-torneo de 4 partidas -- reducir desde mas
         // tarde en el orden, a mas profundidad, y nunca mas de 1 ply.
         const LMR_MOVES_SIN_REDUCIR: usize = 5;
-        const LMR_PROF_MIN: i32 = 5;
+        const LMR_PROF_MIN: i32 = 3;
+
+        // Futility pruning (frontera): cerca de las hojas, si la evaluacion
+        // estatica del nodo mas un margen que crece con la profundidad
+        // sigue sin alcanzar alfa, una jugada silenciosa individual
+        // (no captura, no promocion, no jaque propio) casi nunca va a
+        // remontar eso -- se descarta sin buscarla. Distinto de la poda de
+        // futilidad inversa (que corta el NODO completo contra beta): esta
+        // poda jugadas UNA POR UNA contra alfa, y solo si ya hay al menos
+        // una jugada evaluada (nunca deja el nodo sin ninguna busqueda).
+        const FUT_PROF_MAX: i32 = 4;
+        const FUT_MARGEN_BASE: i32 = 150;
+        const FUT_MARGEN_POR_PLY: i32 = 100;
+        let mut fut_eval: Option<i32> = None;
 
         let mut best_score = -INFINITO;
         let mut best_move = None;
@@ -650,28 +1023,123 @@ impl Searcher {
                 && !mv.is_capture()
                 && mv.promotion.is_none();
 
+            if !en_jaque
+                && depth <= FUT_PROF_MAX
+                && idx > 0
+                && best_move.is_some()
+                && !mv.is_capture()
+                && mv.promotion.is_none()
+                && beta.abs() < MATE - 1000
+            {
+                let ev = *fut_eval.get_or_insert_with(|| {
+                    *static_eval_cache.get_or_insert_with(|| evaluate_with_state(b, eval_state))
+                });
+                if ev + FUT_MARGEN_BASE + FUT_MARGEN_POR_PLY * depth <= alpha {
+                    let next_probe = b.make_move(mv);
+                    if !next_probe.in_check(next_probe.turn) {
+                        continue;
+                    }
+                }
+            }
+
             let pt_mv = b.piece_at(mv.from).map(|(_, pt)| pt as usize).unwrap_or(0);
             let next = b.make_move(mv);
-            let next_nnue = nnue.map(|acumulador| acumulador.despues_de_jugada(b, &next));
             let child_prev = Some((pt_mv, mv.to as usize));
             let ext = if jugada_singular == Some(*mv) { 1 } else { 0 };
+            // Para LMR usamos la profundidad de la posible re-búsqueda
+            // completa, no la reducida: si falla alto no debe heredar una
+            // evaluación clásica donde aún se requiere la NNUE.
+            let next_eval = self.siguiente_estado_busqueda(eval_state, b, &next, depth - 1 + ext);
             let sc = if es_reducible && !next.in_check(next.turn) {
                 self.lmr_intentos += 1;
                 let r = 1i32.min(depth - 2);
+                let child_ply = (ply + 1) as usize;
+                if child_ply < MAX_KILLER_PLY {
+                    self.hindsight_parent_eval[ply as usize] = *fut_eval.get_or_insert_with(|| {
+                        *static_eval_cache.get_or_insert_with(|| evaluate_with_state(b, eval_state))
+                    });
+                    self.hindsight_reduction[child_ply] = r;
+                }
                 // PVS real: el sondeo reducido usa ventana NULA (-alpha-1,-alpha)
                 // -- solo pregunta "esto es mejor que lo que ya tengo?", no
                 // cuanto mejor. Es un bound, no un valor exacto: si supera
                 // alfa, no se confia en el numero, se re-busca a profundidad
                 // Y ventana completas para obtener el valor real.
-                let sondeo = -self.negamax(&next, next_nnue.as_ref(), depth - 1 + ext - r, -alpha - 1, -alpha, ply + 1, child_prev, en_sondeo_se)?;
+                let sondeo = -self.negamax(
+                    &next,
+                    &next_eval,
+                    depth - 1 + ext - r,
+                    -alpha - 1,
+                    -alpha,
+                    ply + 1,
+                    child_prev,
+                    en_sondeo_se,
+                )?;
                 if sondeo > alpha {
                     self.lmr_reintentos += 1;
-                    -self.negamax(&next, next_nnue.as_ref(), depth - 1 + ext, -beta, -alpha, ply + 1, child_prev, en_sondeo_se)?
+                    if child_ply < MAX_KILLER_PLY {
+                        self.hindsight_reduction[child_ply] = 0;
+                    }
+                    -self.negamax(
+                        &next,
+                        &next_eval,
+                        depth - 1 + ext,
+                        -beta,
+                        -alpha,
+                        ply + 1,
+                        child_prev,
+                        en_sondeo_se,
+                    )?
                 } else {
                     sondeo
                 }
             } else {
-                -self.negamax(&next, next_nnue.as_ref(), depth - 1 + ext, -beta, -alpha, ply + 1, child_prev, en_sondeo_se)?
+                let child_ply = (ply + 1) as usize;
+                if child_ply < MAX_KILLER_PLY {
+                    self.hindsight_reduction[child_ply] = 0;
+                }
+                // PVS: la primera jugada recibe la ventana completa. Las
+                // siguientes se sondean con ventana nula; solo se repite la
+                // búsqueda completa si realmente supera alpha y aún no es
+                // un cutoff beta. Esto conserva el resultado de alfa-beta y
+                // reduce nodos en posiciones con buen ordenamiento.
+                if idx == 0 {
+                    -self.negamax(
+                        &next,
+                        &next_eval,
+                        depth - 1 + ext,
+                        -beta,
+                        -alpha,
+                        ply + 1,
+                        child_prev,
+                        en_sondeo_se,
+                    )?
+                } else {
+                    let sondeo = -self.negamax(
+                        &next,
+                        &next_eval,
+                        depth - 1 + ext,
+                        -alpha - 1,
+                        -alpha,
+                        ply + 1,
+                        child_prev,
+                        en_sondeo_se,
+                    )?;
+                    if sondeo > alpha && sondeo < beta {
+                        -self.negamax(
+                            &next,
+                            &next_eval,
+                            depth - 1 + ext,
+                            -beta,
+                            -alpha,
+                            ply + 1,
+                            child_prev,
+                            en_sondeo_se,
+                        )?
+                    } else {
+                        sondeo
+                    }
+                }
             };
 
             if sc > best_score {
@@ -695,22 +1163,9 @@ impl Searcher {
         } else {
             TTFlag::Exact
         };
-        self.tt_store(key, depth, best_score, flag, best_move);
+        self.tt_store(key, depth, best_score, ply, flag, best_move);
 
         Ok(best_score)
-    }
-
-    /// Wrapper publico solo para pruebas dirigidas de quiescence (p.ej. el
-    /// comando CLI "quiescheck") -- llama a quiescence() directo, sin pasar
-    /// por negamax, para poder construir posiciones especificas (jaque con
-    /// una sola evasion, mate inmediato, etc.) y verificar el resultado
-    /// exacto de esa funcion sola.
-    pub fn quiescence_test(&mut self, b: &Board) -> i32 {
-        self.nodes = 0;
-        self.deadline = None;
-        self.stop = false;
-        self.path = self.game_history.clone();
-        self.quiescence(b, None, -INFINITO, INFINITO, 0).unwrap_or(0)
     }
 
     /// Busqueda con profundidad fija (para benchmarks/tests, sin limite de tiempo).
@@ -720,7 +1175,7 @@ impl Searcher {
         self.stop = false;
         self.killers = vec![[None, None]; MAX_KILLER_PLY];
         self.path = self.game_history.clone();
-        let root_nnue = crear_acumulador(b);
+        let root_eval = crear_eval_state(b);
         let mut mejor_mv = None;
         let mut mejor_sc: i32 = -INFINITO;
         for d in 1..=depth {
@@ -732,12 +1187,15 @@ impl Searcher {
             self.order_moves_ply(b, &mut ordered, mejor_mv, 0, None);
 
             const VENTANA_INICIAL: i32 = 50;
-            let (mut vent_alpha, mut vent_beta) =
-                if self.modo_aspiration && d >= 2 && mejor_sc.abs() < MATE - 1000 && mejor_sc > -INFINITO {
-                    (mejor_sc - VENTANA_INICIAL, mejor_sc + VENTANA_INICIAL)
-                } else {
-                    (-INFINITO, INFINITO)
-                };
+            let (mut vent_alpha, mut vent_beta) = if self.modo_aspiration
+                && d >= 2
+                && mejor_sc.abs() < MATE - 1000
+                && mejor_sc > -INFINITO
+            {
+                (mejor_sc - VENTANA_INICIAL, mejor_sc + VENTANA_INICIAL)
+            } else {
+                (-INFINITO, INFINITO)
+            };
             let mut actual_mv;
             let mut actual_sc;
             let mut ancho = VENTANA_INICIAL;
@@ -747,16 +1205,51 @@ impl Searcher {
                 actual_sc = -INFINITO;
                 self.path.push(b.zobrist);
                 let mut interrumpido = false;
-                for mv in &ordered {
+                for (idx, mv) in ordered.iter().enumerate() {
                     let pt_mv = b.piece_at(mv.from).map(|(_, pt)| pt as usize).unwrap_or(0);
                     let next = b.make_move(mv);
-                    let next_nnue = root_nnue.as_ref().map(|acumulador| acumulador.despues_de_jugada(b, &next));
-                    let sc = match self.negamax(&next, next_nnue.as_ref(), d - 1, -vent_beta, -alpha, 1, Some((pt_mv, mv.to as usize)), false) {
+                    // Aplicar la misma puerta clásica que usan los hijos
+                    // internos. Sin esto, las iteraciones d=1/d=2 todavía
+                    // construyen un delta NNUE completo en cada hijo de raíz
+                    // aunque esos nodos ya van a evaluarse en modo clásico.
+                    let next_eval = self.siguiente_estado_busqueda(&root_eval, b, &next, d - 1);
+                    let sondeo_alpha = if idx == 0 { -vent_beta } else { -alpha - 1 };
+                    let sondeo_beta = -alpha;
+                    let sondeo = match self.negamax(
+                        &next,
+                        &next_eval,
+                        d - 1,
+                        sondeo_alpha,
+                        sondeo_beta,
+                        1,
+                        Some((pt_mv, mv.to as usize)),
+                        false,
+                    ) {
                         Ok(v) => -v,
                         Err(_) => {
                             interrumpido = true;
                             break;
                         }
+                    };
+                    let sc = if idx > 0 && sondeo > alpha && sondeo < vent_beta {
+                        match self.negamax(
+                            &next,
+                            &next_eval,
+                            d - 1,
+                            -vent_beta,
+                            -alpha,
+                            1,
+                            Some((pt_mv, mv.to as usize)),
+                            false,
+                        ) {
+                            Ok(v) => -v,
+                            Err(_) => {
+                                interrumpido = true;
+                                break;
+                            }
+                        }
+                    } else {
+                        sondeo
                     };
                     if sc > actual_sc {
                         actual_sc = sc;
@@ -795,12 +1288,19 @@ impl Searcher {
     /// `movetime_ms = None` significa busqueda SIN limite de tiempo propio
     /// (modo "go infinite"): solo termina por `max_depth`, por encontrar un
     /// mate, o porque el hilo UCI activa `external_stop` al recibir "stop".
-    pub fn search_time(&mut self, b: &Board, movetime_ms: Option<u64>, max_depth: i32, mut on_info: impl FnMut(i32, i32, u64, u64)) -> (Option<Move>, i32, i32) {
+    pub fn search_time(
+        &mut self,
+        b: &Board,
+        movetime_ms: Option<u64>,
+        max_depth: i32,
+        mut on_info: impl FnMut(i32, i32, u64, u64),
+    ) -> (Option<Move>, i32, i32) {
         self.nodes = 0;
         self.stop = false;
         self.killers = vec![[None, None]; MAX_KILLER_PLY];
+        self.decaer_history();
         self.path = self.game_history.clone();
-        let root_nnue = crear_acumulador(b);
+        let root_eval = crear_eval_state(b);
 
         // Libro de aperturas: se consulta para CUALQUIER turno (blancas o
         // negras -- la clave Polyglot ya codifica de quien es el turno), no
@@ -823,12 +1323,15 @@ impl Searcher {
 
         let inicio = Instant::now();
         self.deadline = movetime_ms.map(|ms| {
-            let budget = ms.saturating_sub(30).max(10);
+            let budget = ms.saturating_sub(margen_interno_tiempo(ms));
             inicio + std::time::Duration::from_millis(budget)
         });
 
-        let mut mejor_mv: Option<Move> = None;
-        let mut mejor_sc: i32 = 0;
+        // Siempre conservar una jugada legal de emergencia. Asi un reloj de
+        // pocos milisegundos no termina en bestmove 0000 si no completa depth 1.
+        let fallback = generate_legal(b).into_iter().next();
+        let mut mejor_mv: Option<Move> = fallback;
+        let mut mejor_sc: i32 = evaluate_with_state(b, &root_eval);
         let mut mejor_prof = 0;
 
         for d in 1..=max_depth {
@@ -850,11 +1353,12 @@ impl Searcher {
             // de lo esperado) se ensancha y se repite. Nunca cambia la
             // jugada final elegida, solo cuanto cuesta encontrarla.
             const VENTANA_INICIAL: i32 = 50;
-            let (mut vent_alpha, mut vent_beta) = if self.modo_aspiration && d >= 2 && mejor_sc.abs() < MATE - 1000 {
-                (mejor_sc - VENTANA_INICIAL, mejor_sc + VENTANA_INICIAL)
-            } else {
-                (-INFINITO, INFINITO)
-            };
+            let (mut vent_alpha, mut vent_beta) =
+                if self.modo_aspiration && d >= 2 && mejor_sc.abs() < MATE - 1000 {
+                    (mejor_sc - VENTANA_INICIAL, mejor_sc + VENTANA_INICIAL)
+                } else {
+                    (-INFINITO, INFINITO)
+                };
 
             let mut actual_mv;
             let mut actual_sc;
@@ -866,28 +1370,60 @@ impl Searcher {
                 actual_mv = ordered[0];
                 actual_sc = -INFINITO;
                 self.path.push(b.zobrist);
-                for mv in &ordered {
+                for (idx, mv) in ordered.iter().enumerate() {
                     let pt_mv = b.piece_at(mv.from).map(|(_, pt)| pt as usize).unwrap_or(0);
                     let next = b.make_move(mv);
-                    let next_nnue = root_nnue.as_ref().map(|acumulador| acumulador.despues_de_jugada(b, &next));
-                    match self.negamax(&next, next_nnue.as_ref(), d - 1, -vent_beta, -alpha, 1, Some((pt_mv, mv.to as usize)), false) {
-                        Ok(v) => {
-                            let sc = -v;
-                            if sc > actual_sc {
-                                actual_sc = sc;
-                                actual_mv = *mv;
-                            }
-                            if sc > alpha {
-                                alpha = sc;
-                            }
-                            if alpha >= vent_beta {
-                                break; // fail-high contra la ventana: cortar y reintentar mas ancho
-                            }
-                        }
+                    // Mantener el mismo contrato que negamax: si el hijo
+                    // queda dentro de la zona clásica, no construir un delta
+                    // NNUE que no se llegará a consultar.
+                    let next_eval = self.siguiente_estado_busqueda(&root_eval, b, &next, d - 1);
+                    let sondeo_alpha = if idx == 0 { -vent_beta } else { -alpha - 1 };
+                    let sondeo_beta = -alpha;
+                    let sondeo = match self.negamax(
+                        &next,
+                        &next_eval,
+                        d - 1,
+                        sondeo_alpha,
+                        sondeo_beta,
+                        1,
+                        Some((pt_mv, mv.to as usize)),
+                        false,
+                    ) {
+                        Ok(v) => -v,
                         Err(_) => {
                             timed_out = true;
                             break;
                         }
+                    };
+                    let sc = if idx > 0 && sondeo > alpha && sondeo < vent_beta {
+                        match self.negamax(
+                            &next,
+                            &next_eval,
+                            d - 1,
+                            -vent_beta,
+                            -alpha,
+                            1,
+                            Some((pt_mv, mv.to as usize)),
+                            false,
+                        ) {
+                            Ok(v) => -v,
+                            Err(_) => {
+                                timed_out = true;
+                                break;
+                            }
+                        }
+                    } else {
+                        sondeo
+                    };
+                    if sc > actual_sc {
+                        actual_sc = sc;
+                        actual_mv = *mv;
+                    }
+                    if sc > alpha {
+                        alpha = sc;
+                    }
+                    if alpha >= vent_beta {
+                        break; // fail-high contra la ventana: cortar y reintentar mas ancho
                     }
                 }
                 self.path.pop();
@@ -920,7 +1456,14 @@ impl Searcher {
             if mejor_sc.abs() >= MATE - 1000 {
                 break;
             }
-            if let Some(ms) = movetime_ms && inicio.elapsed().as_millis() as u64 > ms * 45 / 100 {
+            // En ultrabullet el deadline duro ya reserva margen; el corte
+            // blando del 70% impedía completar la siguiente iteración aun
+            // cuando quedaban milisegundos útiles. Para tiempos normales se
+            // conserva exactamente el comportamiento anterior.
+            if let Some(ms) = movetime_ms
+                && ms > 25
+                && inicio.elapsed().as_millis() as u64 > ms.saturating_mul(70) / 100
+            {
                 break;
             }
         }
@@ -929,7 +1472,7 @@ impl Searcher {
         // extraer_pv() no puede ni arrancar a caminarla. Guardarla aca no
         // afecta la busqueda en si (pasa DESPUES del loop).
         if let Some(mv) = mejor_mv {
-            self.tt_store(b.zobrist, mejor_prof, mejor_sc, TTFlag::Exact, Some(mv));
+            self.tt_store(b.zobrist, mejor_prof, mejor_sc, 0, TTFlag::Exact, Some(mv));
         }
         (mejor_mv, mejor_sc, mejor_prof)
     }
@@ -972,16 +1515,30 @@ pub fn buscar_lazy_smp(
     tt: &Arc<SharedTT>,
     tt_mask: usize,
     modo_lmr: bool,
+    qsearch_nnue: bool,
+    nnue_classical_depth: i32,
     game_history: &[u64],
     external_stop: Arc<AtomicBool>,
 ) -> (Option<Move>, i32, u64, Vec<ResultadoHilo>) {
     if n_hilos <= 1 {
         let mut s = Searcher::new_con_tt_compartida(Arc::clone(tt), tt_mask, modo_lmr);
+        s.set_qsearch_nnue(qsearch_nnue);
+        s.set_nnue_classical_depth(nnue_classical_depth);
         s.set_external_stop(Some(external_stop));
         s.set_game_history(game_history.to_vec());
         let (mv, sc, prof) = s.search_time(b, movetime_ms, max_depth, |_, _, _, _| {});
         let nodos = s.nodes;
-        return (mv, sc, nodos, vec![ResultadoHilo { mv, score: sc, profundidad: prof, nodos }]);
+        return (
+            mv,
+            sc,
+            nodos,
+            vec![ResultadoHilo {
+                mv,
+                score: sc,
+                profundidad: prof,
+                nodos,
+            }],
+        );
     }
 
     let board_copy = *b;
@@ -993,16 +1550,32 @@ pub fn buscar_lazy_smp(
             let game_history = game_history.to_vec();
             std::thread::spawn(move || {
                 let mut s = Searcher::new_con_tt_compartida(tt, tt_mask, modo_lmr);
+                s.set_qsearch_nnue(qsearch_nnue);
+                s.set_nnue_classical_depth(nnue_classical_depth);
                 s.variante_orden_raiz = i % 2 == 1;
+                s.null_move_r_extra = match i % 3 {
+                    1 => 1,
+                    2 => -1,
+                    _ => 0,
+                };
                 s.set_external_stop(Some(external_stop));
                 s.set_game_history(game_history);
-                let (mv, sc, prof) = s.search_time(&board_copy, movetime_ms, max_depth, |_, _, _, _| {});
-                ResultadoHilo { mv, score: sc, profundidad: prof, nodos: s.nodes }
+                let (mv, sc, prof) =
+                    s.search_time(&board_copy, movetime_ms, max_depth, |_, _, _, _| {});
+                ResultadoHilo {
+                    mv,
+                    score: sc,
+                    profundidad: prof,
+                    nodos: s.nodes,
+                }
             })
         })
         .collect();
 
-    let resultados: Vec<ResultadoHilo> = handles.into_iter().map(|h| h.join().expect("hilo de busqueda con panic")).collect();
+    let resultados: Vec<ResultadoHilo> = handles
+        .into_iter()
+        .map(|h| h.join().expect("hilo de busqueda con panic"))
+        .collect();
 
     let nodos_totales: u64 = resultados.iter().map(|r| r.nodos).sum();
     // v12: NO usar score.abs() para desempatar entre hilos con la misma
@@ -1020,4 +1593,67 @@ pub fn buscar_lazy_smp(
         .expect("al menos un hilo");
 
     (mejor.mv, mejor.score, nodos_totales, resultados)
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+
+    #[test]
+    fn score_mate_tt_roundtrip_en_distintos_plies() {
+        for ply in [0, 1, 7, 31] {
+            let gana = MATE - 12;
+            let pierde = -MATE + 9;
+            assert_eq!(score_from_tt(score_to_tt(gana, ply), ply), gana);
+            assert_eq!(score_from_tt(score_to_tt(pierde, ply), ply), pierde);
+            assert_eq!(score_from_tt(score_to_tt(123, ply), ply), 123);
+        }
+    }
+
+    #[test]
+    fn tt_colision_de_otra_clave_se_reemplaza() {
+        let mut s = Searcher::new(1);
+        let k1 = 0x10u64;
+        let k2 = k1.wrapping_add((s.tt_mask as u64) + 1);
+        s.tt_store(k1, 12, 50, 0, TTFlag::Exact, None);
+        s.tt_store(k2, 1, 20, 0, TTFlag::Alpha, None);
+        assert!(s.tt_probe(k1).is_none());
+        assert_eq!(s.tt_probe(k2).map(|e| e.depth), Some(1));
+    }
+
+    #[test]
+    fn quiescence_detecta_mate_en_jaque() {
+        let b = Board::from_fen("7k/6Q1/6K1/8/8/8/8/8 b - - 0 1").unwrap();
+        let mut s = Searcher::new(1);
+        let eval_state = crear_eval_state(&b);
+        let score = s
+            .quiescence(&b, &eval_state, -INFINITO, INFINITO, 3)
+            .unwrap();
+        assert_eq!(score, -MATE + 3);
+    }
+
+    #[test]
+    fn quiescence_respeta_regla_de_cincuenta() {
+        let b = Board::from_fen("4k3/8/8/8/8/8/4Q3/4K3 w - - 100 1").unwrap();
+        let mut s = Searcher::new(1);
+        let eval_state = crear_eval_state(&b);
+        assert_eq!(
+            s.quiescence(&b, &eval_state, -INFINITO, INFINITO, 0)
+                .unwrap(),
+            draw_score(&b, &eval_state)
+        );
+    }
+
+    #[test]
+    fn reloj_ultracorto_usa_margen_adaptativo_seguro() {
+        assert_eq!(margen_interno_tiempo(2), 0);
+        assert_eq!(margen_interno_tiempo(15), 3);
+        assert_eq!(margen_interno_tiempo(20), 3);
+        assert_eq!(margen_interno_tiempo(50), 4);
+        assert_eq!(margen_interno_tiempo(200), 5);
+        assert_eq!(margen_interno_tiempo(600), 5);
+        for ms in 1..=1_000 {
+            assert!(margen_interno_tiempo(ms) < ms);
+        }
+    }
 }

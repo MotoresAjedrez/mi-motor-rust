@@ -122,7 +122,12 @@ pub struct Move {
 
 impl Move {
     pub fn new(from: Square, to: Square, promotion: Option<PieceType>, flag: MoveFlag) -> Move {
-        Move { from, to, promotion, flag }
+        Move {
+            from,
+            to,
+            promotion,
+            flag,
+        }
     }
 
     pub fn is_capture(&self) -> bool {
